@@ -7,6 +7,10 @@ PRODUCT_LK2ND = "lk2nd-msm8952"
 # The toolbox's USB mass storage gadget (rootfs/init)
 TOOLBOX_USB_ID = ("05c6", "9092")
 TOOLBOX_USB_MODEL = "File-Stor Gadget"
+# When the toolbox shares the SD card (not the phone's own storage) it gives the
+# USB disk this model name instead, so `flip sd write` can find it and tell it
+# apart from the eMMC. Must match SD_INQUIRY in rootfs/init.
+TOOLBOX_SD_MODEL = "flip SD card"
 
 # Partition sizes (from `fastboot getvar all` on the reference phone)
 RECOVERY_SIZE = 0x3000000  # 48 MiB
@@ -21,7 +25,12 @@ EMMC_SIZE_RANGE = (3_000_000_000, 4_300_000_000)
 
 KERNEL_DTB = "arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dtb"
 KERNEL_DTB_NAME = "qm215-nokia-weeknd.dtb"
-BOOT_CMDLINE = "console=tty1 rw loglevel=7 fbcon=font:10x18"
+# flip_toolbox=N marks what the flashed toolbox can do; flip reads it back from
+# the recovery partition (on the phone) before relying on a feature.
+#   2: shares the SD card on request (sd.request_card_share) and restarts into
+#      the card's Linux when the computer ejects it.
+TOOLBOX_VERSION = 2
+BOOT_CMDLINE = f"console=tty1 rw loglevel=7 fbcon=font:10x18 flip_toolbox={TOOLBOX_VERSION}"
 
 LK2ND_TARGET = "lk2nd-msm8952"
 LK2ND_MAKE_ARGS = [
@@ -37,7 +46,7 @@ OVERLAYS = ["wnd1", "wnd2e", "wnd2"]
 BUSYBOX_APPLETS = [
     "sh", "ls", "mkdir", "ln", "cat", "dd", "grep", "sed", "clear", "resize",
     "fold", "tail", "head", "sleep", "dmesg", "mount", "umount", "sync",
-    "reboot", "poweroff",
+    "reboot", "poweroff", "mv",
 ]
 
 

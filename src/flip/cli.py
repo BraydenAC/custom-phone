@@ -50,6 +50,18 @@ def _root(version: bool = typer.Option(False, "--version", callback=_version, is
 
 # --- build / flash / clean -------------------------------------------------
 
+def asker(yes: bool):
+    """confirm(question) for the commands: --yes skips it; a yes is acknowledged."""
+    def confirm(question: str) -> bool:
+        if yes:
+            return True
+        if typer.confirm(question, default=False):
+            say("Continuing...")
+            return True
+        return False
+    return confirm
+
+
 @app.command("build")
 def cmd_build(
     jobs: int = typer.Option(config.jobs_default(), "-j", "--jobs", help="Parallel make jobs."),
@@ -69,7 +81,7 @@ def cmd_flash(
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
 ) -> None:
     """Flash the phone (must be in stock fastboot: hold volume-down while plugging in)."""
-    flash.flash(target, confirm=lambda q: yes or typer.confirm(q, default=False))
+    flash.flash(target, confirm=asker(yes))
 
 
 @app.command("clean")
@@ -235,18 +247,27 @@ def cmd_sd_build(
     sd.build_image(debug=debug, backup_name=backup_name)
 
 
+CARD_HELP = ("The card in this computer, e.g. /dev/mmcblk0 (see lsblk). "
+             "Leave out to use the card in the phone, over USB.")
+
+
 @sd_app.command("write")
-def cmd_sd_write(dev: str = typer.Argument(..., help="The card, e.g. /dev/mmcblk0 (see lsblk)"),
+def cmd_sd_write(dev: Optional[str] = typer.Argument(None, help=CARD_HELP),
                  yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask.")) -> None:
-    """Erase a card and write the image to it, then read it back to verify."""
-    sd.write_card(dev, confirm=lambda q: yes or typer.confirm(q, default=False))
+    """Erase a card and write the image to it, then read it back to verify.
+
+    With no device, the card stays in the phone: flip restarts the phone into the
+    toolbox, which shares the card over USB, and back into Linux afterwards."""
+    sd.write_card(dev, confirm=asker(yes))
 
 
 @sd_app.command("update")
-def cmd_sd_update(dev: str = typer.Argument(..., help="The card, e.g. /dev/mmcblk0"),
+def cmd_sd_update(dev: Optional[str] = typer.Argument(None, help=CARD_HELP),
                   yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask.")) -> None:
-    """Put the current kernel, device tree and modules on a card, keeping its data."""
-    sd.update_card(dev, confirm=lambda q: yes or typer.confirm(q, default=False))
+    """Put the current kernel, device tree and modules on a card, keeping its data.
+
+    With no device, the card stays in the phone (as for `flip sd write`)."""
+    sd.update_card(dev, confirm=asker(yes))
 
 
 @sd_app.command("info")

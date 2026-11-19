@@ -12,6 +12,11 @@
      GPT) and fixed partition IDs. `flip sd write` then extends the root
      partition to the end of the card; the file system grows on first boot.
 
+The card can stay in the phone: without a device argument, `flip sd write` and
+`update` ask the phone's Linux (over flipd) to restart into the toolbox, which
+shares the card over USB as a disk named profile.TOOLBOX_SD_MODEL. After
+writing, flip ejects it and the toolbox restarts into the card's Linux.
+
 The image contains your phone's firmware and its flip-link identity key:
 treat it like backups/ (private, never shared or committed).
 """
@@ -19,10 +24,12 @@ treat it like backups/ (private, never shared or committed).
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import shutil
 import tarfile
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -429,6 +436,7 @@ class Card:
     model: str
     mounts: list[str]
     holds_system: bool  # contains / or /boot of this computer
+    ro: bool = False
 
 
 SD_SIZE_RANGE = (3_800_000_000, 130_000_000_000)  # "4 GB" .. "128 GB" cards
@@ -436,7 +444,7 @@ SYSTEM_MOUNTS = {"/", "/boot", "/boot/efi", "/efi", "/home", "/usr", "/var", "[S
 
 
 def inspect_card(dev: str) -> Card:
-    out = run(["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,TRAN,HOTPLUG,MODEL,MOUNTPOINTS",
+    out = run(["lsblk", "-J", "-b", "-o", "NAME,TYPE,SIZE,TRAN,HOTPLUG,MODEL,RO,MOUNTPOINTS",
                dev], capture=True, quiet=True).stdout
     node = json.loads(out)["blockdevices"][0]
     if node.get("type") != "disk":
@@ -453,7 +461,8 @@ def inspect_card(dev: str) -> Card:
     return Card(dev, int(node["size"]), (node.get("tran") or "").lower(),
                 node.get("hotplug") in (True, "1", 1),
                 (node.get("model") or "").strip(), mounts,
-                any(m in SYSTEM_MOUNTS or m.startswith("/boot") for m in mounts))
+                any(m in SYSTEM_MOUNTS or m.startswith("/boot") for m in mounts),
+                node.get("ro") in (True, "1", 1))
 
 
 def check_card(card: Card, image_size: int) -> None:
@@ -475,20 +484,36 @@ def check_card(card: Card, image_size: int) -> None:
     if card.size < image_size:
         raise FlipError(f"{card.path} ({card.size} bytes) is smaller than the image "
                         f"({image_size} bytes)")
+    if card.ro:
+        hint = (" The phone is sharing it read-only: in the toolbox use '5. SD to computer'."
+                if card.model == profile.TOOLBOX_SD_MODEL else "")
+        raise FlipError(f"{card.path} is read-only (write-protect switch?).{hint}")
+
+
+def partitions(dev: str) -> list[dict]:
+    """dev's partitions as lsblk entries: path, label, mountpoints.
+
+    -l (a flat list, filtered by type): lsblk only nests partitions under their
+    disk when the NAME column is shown, so don't rely on "children".
+    """
+    out = run(["lsblk", "-J", "-l", "-o", "PATH,TYPE,LABEL,MOUNTPOINTS", dev], capture=True,
+              quiet=True).stdout
+    return [n for n in json.loads(out)["blockdevices"] if n.get("type") == "part"]
 
 
 def unmount_all(card: Card) -> None:
-    out = run(["lsblk", "-J", "-o", "PATH,MOUNTPOINTS", card.path], capture=True,
-              quiet=True).stdout
-    for n in json.loads(out)["blockdevices"][0].get("children", []):
+    for n in partitions(card.path):
         if any(n.get("mountpoints") or []):
             run(["udisksctl", "unmount", "-b", n["path"]])
 
 
-def write_card(dev: str, confirm) -> None:
+def write_card(dev: str | None, confirm) -> None:
     manifest = read_manifest()
     if not IMAGE.exists() or IMAGE.stat().st_size != manifest["size"]:
         raise FlipError("out/sd/sd.img is missing or incomplete: run `flip sd build`")
+    in_phone = dev is None
+    if dev is None:
+        dev = phone_card(confirm)
     if not Path(dev).is_block_device():
         raise FlipError(f"{dev} is not a block device (see lsblk)")
     card = inspect_card(dev)
@@ -516,7 +541,11 @@ def write_card(dev: str, confirm) -> None:
                         "). The card may be faulty or fake-capacity.")
     say("extending the root partition to the end of the card ...")
     grow_root_partition(dev)
-    say("card written and verified. Eject it, put it in the phone and power on.")
+    if in_phone:
+        release_card(dev)
+        say("card written and verified. The phone is starting Linux from it.")
+    else:
+        say("card written and verified. Eject it, put it in the phone and power on.")
 
 
 def grow_root_partition(dev: str, sudo: bool = True) -> None:
@@ -529,14 +558,31 @@ def grow_root_partition(dev: str, sudo: bool = True) -> None:
 
 # --- updating a card in place -----------------------------------------------------
 
-def update_card(dev: str, confirm) -> None:
+def partitions_by_label(dev: str, wait: float = 15) -> dict[str, dict]:
+    """{label: lsblk entry} for dev's partitions.
+
+    Labels come from udev, which reads them a moment after a disk appears (a card
+    the phone just shared, or one just plugged in): wait until every partition
+    has one, up to `wait` seconds.
+    """
+    run(["udevadm", "settle", f"--timeout={int(wait)}"], check=False, quiet=True)
+    deadline = time.monotonic() + wait
+    while True:
+        children = partitions(dev)
+        if all(c.get("label") for c in children) or time.monotonic() > deadline:
+            return {c.get("label"): c for c in children if c.get("label")}
+        time.sleep(0.5)
+
+def update_card(dev: str | None, confirm) -> None:
     """Replace kernel, device tree and modules on a flip card; keep everything else."""
+    in_phone = dev is None
+    if dev is None:
+        dev = phone_card(confirm)
     if not Path(dev).is_block_device():
         raise FlipError(f"{dev} is not a block device (see lsblk)")
     card = inspect_card(dev)
     check_card(card, 0)
-    out = run(["lsblk", "-J", "-o", "PATH,LABEL", dev], capture=True, quiet=True).stdout
-    parts = {c.get("label"): c for c in json.loads(out)["blockdevices"][0].get("children", [])}
+    parts = partitions_by_label(dev)
     if profile.SD_BOOT_LABEL not in parts or profile.SD_ROOT_LABEL not in parts:
         raise FlipError(f"{dev} is not a flip SD card (no {profile.SD_BOOT_LABEL}/"
                         f"{profile.SD_ROOT_LABEL} partitions)")
@@ -566,4 +612,118 @@ def update_card(dev: str, confirm) -> None:
             run(["sudo", "umount", root_mnt])
     finally:
         run(["sudo", "umount", boot_mnt])
-    say("card updated")
+    if in_phone:
+        release_card(dev)
+        say("card updated. The phone is starting Linux from it.")
+    else:
+        say("card updated")
+
+
+# --- the card while it's in the phone ------------------------------------------
+
+# rootfs/init SD_REQUEST: renaming extlinux.conf to this makes lk2nd start the
+# toolbox instead (it finds nothing to boot), and tells the toolbox to share the
+# card. The toolbox renames it back first thing, so this is one-shot.
+SHARE_REQUEST = "extlinux/extlinux.conf.toolbox-once"
+SHARE_WAIT = 180  # seconds: Linux shutdown + bootloader warning + toolbox start
+# lk2nd, then the toolbox boot image (with its command line in the header).
+TOOLBOX_HEADER_END = profile.LK2ND_SLOT + 4096
+
+PHONE_TOOLBOX_VERSION = (
+    "v=$(head -c {end} /dev/disk/by-partlabel/recovery | grep -ao 'flip_toolbox=[0-9]*' "
+    "| head -n 1 | cut -d= -f2); echo \"${{v:-0}}\"")
+# Rename, then reboot with the reason that makes the bootloader start lk2nd
+# (pm8916 pon reboot-mode). The reboot is checked first (--dry-run), runs 2 s
+# later so the reply gets back, and puts the file back if it fails after all.
+REBOOT_TO_LK2ND = "systemctl reboot --reboot-argument=recovery"
+PHONE_REQUEST_SHARE = (
+    "set -eu; mountpoint -q /boot; cd /boot/extlinux; test -f extlinux.conf; "
+    f"{REBOOT_TO_LK2ND} --dry-run; "
+    "mv extlinux.conf {req}; sync; "
+    "systemd-run --quiet --on-active=2 sh -c "
+    f"'{REBOOT_TO_LK2ND} || {{{{ mv /boot/extlinux/{{req}} /boot/extlinux/extlinux.conf; sync; }}}}' "
+    "|| {{ mv {req} extlinux.conf; sync; exit 1; }}")
+PHONE_UNDO_SHARE = ("cd /boot/extlinux; if [ -f {req} ]; then mv {req} extlinux.conf; sync; "
+                    "echo restored; fi")
+RESTART_GRACE = 60  # seconds: if the phone's Linux link is still up by then, it didn't restart
+
+
+def find_shared_card(lsblk_json: str | None = None) -> str | None:
+    """The phone's SD card if the toolbox is sharing it over USB right now."""
+    if lsblk_json is None:
+        lsblk_json = run(["lsblk", "-J", "-d", "-b", "-o", "PATH,TYPE,SIZE,MODEL"],
+                         capture=True, quiet=True).stdout
+    found = [d["path"] for d in json.loads(lsblk_json)["blockdevices"]
+             if d.get("type") == "disk" and int(d.get("size") or 0) > 0
+             and (d.get("model") or "").strip() == profile.TOOLBOX_SD_MODEL]
+    if len(found) > 1:
+        raise FlipError(f"several phones are sharing SD cards ({', '.join(found)}); "
+                        "give the device")
+    return found[0] if found else None
+
+
+def _phone_sh(script: str) -> str:
+    """Run a shell script on the phone as root (its own session: one operation each)."""
+    out, err = io.BytesIO(), io.BytesIO()
+    with phone.session() as s:
+        code = s.run(["sh", "-c", script], None, out, err)
+    if code != 0:
+        raise FlipError(f"on the phone: {err.getvalue().decode(errors='replace').strip()} "
+                        f"(exit {code})")
+    return out.getvalue().decode().strip()
+
+
+def phone_card(confirm) -> str:
+    """Get the SD card in the phone shared with this computer; return its device."""
+    dev = find_shared_card()
+    if dev:
+        say(f"{dev} is the phone's SD card, shared by the toolbox")
+        return dev
+    if not phone.client.find_ports():
+        raise FlipError(
+            "the phone isn't connected. Either:\n"
+            "   - start Linux from the SD card and plug in USB (flip restarts it into "
+            "the toolbox), or\n"
+            "   - start the toolbox (volume-up at power-on, held past the warning) and "
+            "choose '5. SD to computer', or\n"
+            "   - put the card in this computer and give its device, e.g. /dev/mmcblk0")
+    version = _phone_sh(PHONE_TOOLBOX_VERSION.format(end=TOOLBOX_HEADER_END))
+    if not version.isdigit() or int(version) < 2:
+        raise FlipError(
+            "the toolbox flashed on the phone can't share the SD card on request yet. "
+            "Flash the current one first (`flip build`, then `flip flash`), or take "
+            "the card out and give its device.")
+    if not confirm("The phone will restart into its toolbox and share its SD card "
+                   "with this computer. Continue?"):
+        raise FlipError("aborted")
+    req = SHARE_REQUEST.split("/")[-1]
+    _phone_sh(PHONE_REQUEST_SHARE.format(req=req))
+    say("the phone is restarting into the toolbox; waiting for its SD card ...")
+    start = time.monotonic()
+    while time.monotonic() < start + SHARE_WAIT:
+        time.sleep(2)
+        dev = find_shared_card()
+        if dev:
+            say(f"{dev} is the phone's SD card")
+            time.sleep(2)  # let the desktop's automounter finish; write_card unmounts
+            return dev
+        if time.monotonic() > start + RESTART_GRACE and phone.client.find_ports():
+            try:
+                undone = _phone_sh(PHONE_UNDO_SHARE.format(req=req))
+            except FlipError:
+                continue  # the link is going down after all: keep waiting
+            raise FlipError(
+                "the phone didn't restart (its Linux is still running)"
+                + ("; its boot configuration is back in place" if undone else "")
+                + ". See `flip phone run -- journalctl -b -n 50`.")
+    raise FlipError(
+        f"the phone didn't share its SD card within {SHARE_WAIT} s. If it shows KaiOS, it "
+        "didn't restart into lk2nd: power it off, then hold volume-up while powering on and "
+        "release it at the warning. The toolbox then shares the card by itself; run this "
+        "again.")
+
+
+def release_card(dev: str) -> None:
+    """Eject the phone's card; the toolbox sees that and starts the card's Linux."""
+    say(f"ejecting {dev} (the phone then restarts into Linux)")
+    run(["sudo", "eject", dev])

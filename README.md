@@ -99,6 +99,28 @@ writing; the file system grows to match on first boot. Put the card in the
 phone and power on holding volume-up, releasing it when the warning appears
 (holding it longer picks the toolbox); lk2nd finds the card and boots it.
 
+**Leaving the card in the phone.** Once the card is in the phone, `flip sd
+write` and `flip sd update` work without a device argument:
+
+```sh
+flip sd update                 # new kernel/modules, keeps the card's data
+flip sd write                  # erase and rewrite the whole card
+```
+
+If the phone is running the card's Linux and is plugged in, flip asks it (over
+`flipd`) to restart into the toolbox. The toolbox shares the card over USB as a
+disk named "flip SD card", flip writes it, ejects it, and the phone restarts
+into Linux. If the phone isn't running Linux (e.g. the card is broken), start
+the toolbox and choose **5. SD to computer** first. Menu item **6. Start SD
+Linux** boots the card without holding keys. This needs a toolbox flashed
+from this version of flip or later (flip checks before restarting the phone).
+
+How it works: flip renames the card's `extlinux.conf`, so lk2nd finds nothing
+to boot and starts the toolbox; the toolbox renames it back straight away, so
+it's one-shot. The phone restarts with the "recovery" reboot reason, which the
+bootloader answers by starting lk2nd. The toolbox only shares the eMMC under its
+usual name, which `flip sd write` always refuses.
+
 **Access.** There is no SSH and nothing on the phone accepts network
 connections (nftables drops all incoming traffic). Administration (a shell,
 installing software, protected settings) works only over the USB cable,
