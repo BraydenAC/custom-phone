@@ -1,0 +1,17 @@
+[Unit]
+Description=Start the screen (its panel config file is on the root file system)
+# The panel driver is built into the kernel and probes before the root file
+# system is mounted, so it can't find /usr/lib/firmware/<panel>.bin and gives
+# up. Bind it again once the root file system is there. Only one of the two
+# panel variants is fitted; binding the other one fails, which is fine.
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'for d in spi0.0 spi0.1; do [ -e /sys/bus/spi/devices/$d/driver ] || echo $d > /sys/bus/spi/drivers/panel-mipi-dbi-spi/bind 2>/dev/null; done; true'
+
+[Install]
+WantedBy=sysinit.target

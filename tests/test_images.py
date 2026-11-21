@@ -78,5 +78,8 @@ def test_initramfs_rejects_duplicates():
 def test_toolbox_contains_init_and_applets(tmp_path):
     bb = tmp_path / "busybox"
     bb.write_bytes(b"BB")
-    paths = {e.path for e in build.toolbox_entries(bb)}
-    assert {"init", "sbin/busybox", "sbin/reboot", "sbin/sync"} <= paths
+    rm = tmp_path / "reboot-mode"
+    rm.write_bytes(b"RM")
+    paths = {e.path for e in build.toolbox_entries(bb, rm)}
+    assert {"init", "sbin/busybox", "sbin/reboot", "sbin/sync", "sbin/mv",
+            "sbin/reboot-mode"} <= paths

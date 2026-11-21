@@ -18,6 +18,18 @@ red="${esc}[31m"
 bold="${esc}[1m"
 normal="${esc}[m"
 
+lun=/usb/g1/functions/mass_storage.0/lun.0
+SD_DISK=/dev/mmcblk1
+SD_BOOT=/dev/mmcblk1p1
+# SCSI vendor (8) + product (16) + revision (4). When the SD card is shared the
+# computer sees the product as the disk's model; `flip sd write` looks for
+# exactly this (profile.TOOLBOX_SD_MODEL) and refuses the eMMC's default model.
+SD_INQUIRY="Nokia   flip SD card    0001"
+# Left on the SD card's boot partition by `flip sd write/update` (via flipd)
+# before restarting here: lk2nd finds no extlinux.conf and starts the toolbox,
+# which puts the file back and shares the card.
+SD_REQUEST=extlinux/extlinux.conf.toolbox-once
+
 pager() {
 	local scroll width height
 	scroll=0
@@ -112,8 +124,24 @@ usb_eject_mass_storage() {
 	echo 1 > /usb/g1/functions/mass_storage.0/lun.0/forced_eject
 }
 
+# The computer reads the disk's identity only when the USB device connects, so
+# changing it means reconnecting.
+usb_identity=
+usb_set_identity() {
+	[ "$usb_identity" = "$1" ] && return 0
+	echo "" > /usb/g1/UDC
+	echo "$1" > $lun/inquiry_string
+	usb_identity="$1"
+	echo "$(ls /sys/class/udc)" > /usb/g1/UDC
+}
+
 usb_config_mass_storage() {
-	echo "$1" > /usb/g1/functions/mass_storage.0/lun.0/file
+	if [ "$1" = "$SD_DISK" ]; then
+		usb_set_identity "$SD_INQUIRY"
+	else
+		usb_set_identity ""
+	fi
+	echo "$1" > $lun/file
 }
 
 # The LUN's read-only flag can only be changed while no file is attached.
@@ -285,6 +313,73 @@ disable_fscrypt() {
 	fi
 }
 
+# True if flip asked (through the card's Linux) for the card to be shared.
+# Puts extlinux.conf back either way, so the next start is Linux again.
+sd_share_requested() {
+	local i found=1
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		[ -b $SD_BOOT ] && break
+		sleep 0.5
+	done
+	[ -b $SD_BOOT ] || return 1
+	mkdir -p /sdboot
+	mount -t ext2 $SD_BOOT /sdboot 2>/dev/null || return 1
+	if [ -e /sdboot/$SD_REQUEST ]; then
+		mv /sdboot/$SD_REQUEST /sdboot/extlinux/extlinux.conf && found=0
+	fi
+	umount /sdboot
+	sync
+	return $found
+}
+
+# Share the SD card read-write with the computer until it ejects it, then
+# restart into the card's Linux.
+sd_share_for_computer() {
+	if ! [ -b $SD_DISK ]; then
+		echo "${red}${bold}No SD card found.${normal}"
+		return 1
+	fi
+	echo 0 > $lun/ro
+	usb_config_mass_storage $SD_DISK
+	clear
+	echo "== ${green}NOKIA  WEEKND${normal} =="
+	echo "== ${red}SD CARD SHARED${normal} =="
+	echo "==================="
+	echo "The computer can now"
+	echo "write the SD card."
+	echo
+	echo "When it ejects the"
+	echo "card, the phone starts"
+	echo "Linux from it."
+	echo
+	echo "${green}${backarrow}  Stop sharing${normal}"
+	while true; do
+		key=
+		read -s -n 1 -t 1 key
+		if [ "$key" = "$back" ]; then
+			usb_eject_mass_storage
+			echo 1 > $lun/ro
+			clear
+			return 0
+		fi
+		if [ -z "$(cat $lun/file)" ]; then
+			clear
+			echo "Card ejected."
+			echo "Starting Linux..."
+			start_sd_linux
+			return 1
+		fi
+	done
+}
+
+# lk2nd boots the SD card's Linux when restarted with the "recovery" reason
+# (a plain reboot goes back to KaiOS).
+start_sd_linux() {
+	sync
+	reboot-mode recovery
+	echo "${red}${bold}Restart failed.${normal}"
+}
+
 menu() {
 	usb_check_mass_storage
 	echo "== ${green}NOKIA  WEEKND${normal} =="
@@ -296,6 +391,10 @@ menu() {
 		echo "1. Power off"
 		echo "2. USB storage..."
 		echo "3. Disable encryption"
+		if [ -e $SD_DISK ]; then
+			echo "5. SD to computer"
+			echo "6. Start SD Linux"
+		fi
 	fi
 	echo "4. View kernel logs"
 	echo "${normal}==================="
@@ -304,6 +403,9 @@ menu() {
 
 init_usb
 clear
+if sd_share_requested; then
+	sd_share_for_computer
+fi
 menu
 
 while true; do
@@ -322,6 +424,12 @@ while true; do
 			;;
 		4)
 			pager dmesg
+			;;
+		5)
+			ensure_ums_off && sd_share_for_computer
+			;;
+		6)
+			ensure_ums_off && start_sd_linux
 			;;
 	esac
 	menu
