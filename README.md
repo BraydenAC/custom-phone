@@ -149,6 +149,21 @@ admin functions. Debian security updates install automatically.
 `flip sd build --debug` replaces flipd with a root login on the USB serial line,
 for first bring-up only. Anyone with a cable gets root on a debug card.
 
+### Hardware on the SD system
+
+| | |
+|---|---|
+| Battery, charging | pm8916 charger + fuel gauge (`/sys/class/power_supply`) |
+| Wi-Fi | NetworkManager; the phone's own MAC (from the `deviceinfo` partition) |
+| Clock | systemd-timesyncd once online |
+| Audio | ALSA UCM; `/usr/lib/flip/audio-test speaker\|earpiece\|headphones\|mic\|headset` |
+| Power key | short press: ignored (for apps); hold ~5 s: power off. Unplug USB first |
+| GPU | Adreno a300 firmware, loaded on first use |
+| Modem | rmtfs, tqftpserv, `flip-modem-data` (opens the data channel), ModemManager. Data, SMS and calls are untested (no SIM yet) |
+
+Kernel changes live in `patches/linux/` and are re-applied to the pinned source
+on every build.
+
 ## Pinned inputs
 
 Every external input is pinned in `pins.toml`, by commit SHA or SHA-256, with

@@ -1,0 +1,24 @@
+From: flip
+Subject: [PATCH] arm64: dts: qcom: weeknd: report the power key as KEY_POWER
+
+The red end/power key was KEY_HANGUP_PHONE, which systemd-logind ignores,
+so the key did nothing under Debian. Report KEY_POWER; logind is set to
+power off on a long press and ignore short presses (left to call apps).
+
+diff --git i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+--- i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
++++ w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+@@ -377,7 +377,12 @@
+ };
+ 
+ &pm8916_pwrkey {
+-	linux,code = <KEY_HANGUP_PHONE>;
++	/*
++	 * The red end/power key. KEY_POWER lets systemd-logind act on a
++	 * long press (poweroff); a short press is left to the phone apps
++	 * (end call), with HandlePowerKey=ignore.
++	 */
++	linux,code = <KEY_POWER>;
+ };
+ 
+ &pm8916_resin {
