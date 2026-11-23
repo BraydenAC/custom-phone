@@ -1,0 +1,87 @@
+From: flip
+Subject: [PATCH] arm64: dts: qcom: weeknd: battery, charger and fuel gauge
+
+Enable the PM8916 linear charger and voltage-mode BMS with the stock
+battery data (WND1-FIH1500: 4.4 V, 1000 mA, 1500 mAh, 25 C OCV table).
+The charger also provides the USB cable extcon; pm8941-misc on the same
+registers is dropped (shared interrupt, no usb_id line on this phone).
+
+diff --git i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+index fa1e128dd..98e9bc33a 100644
+--- i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
++++ w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+@@ -26,6 +26,28 @@ chosen {
+ 		stdout-path = "serial0";
+ 	};
+ 
++	/*
++	 * WND1-FIH1500 (1500 mAh). Limits and the 25 C open-circuit-voltage
++	 * table come from the stock device tree (qrd_batterydata_wnd and the
++	 * "WND" overlay: vddmax 4400 mV, ibatsafe 1000 mA, cutoff 3.4 V).
++	 */
++	battery: battery {
++		compatible = "simple-battery";
++		voltage-min-design-microvolt = <3400000>;
++		voltage-max-design-microvolt = <4400000>;
++		charge-full-design-microamp-hours = <1500000>;
++
++		ocv-capacity-celsius = <25>;
++		ocv-capacity-table-0 = <4380000 100>, <4298000 95>, <4236000 90>,
++			<4178000 85>, <4123000 80>, <4070000 75>, <4018000 70>,
++			<3969000 65>, <3918000 60>, <3876000 55>, <3846000 50>,
++			<3820000 45>, <3798000 40>, <3780000 35>, <3764000 30>,
++			<3750000 25>, <3732000 20>, <3710000 16>, <3692000 13>,
++			<3686000 11>, <3684000 10>, <3682000 9>, <3678000 8>,
++			<3671000 7>, <3650000 6>, <3612000 5>, <3558000 4>,
++			<3488000 3>, <3392000 2>, <3249000 1>, <3000000 0>;
++	};
++
+ 	backlight: backlight {
+ 		compatible = "pwm-backlight";
+ 		pwms = <&pm8916_pwm 0 100000>;
+@@ -335,6 +357,19 @@ &modem {
+ 	status = "okay";
+ };
+ 
++&pm8916_bms {
++	monitored-battery = <&battery>;
++	power-supplies = <&pm8916_charger>;
++	status = "okay";
++};
++
++&pm8916_charger {
++	qcom,vdd-safe = <4400000>;
++	qcom,ibat-safe = <1000000>;
++	monitored-battery = <&battery>;
++	status = "okay";
++};
++
+ &pm8916_pwm {
+ 	pinctrl-0 = <&pwm_out>;
+ 	pinctrl-names = "default";
+@@ -350,10 +385,6 @@ &pm8916_resin {
+ 	status = "okay";
+ };
+ 
+-&pm8916_usbin {
+-	status = "okay";
+-};
+-
+ &pm8916_vib {
+ 	status = "okay";
+ };
+@@ -505,12 +536,12 @@ platform {
+ };
+ 
+ &usb {
+-	extcon = <&pm8916_usbin>;
++	extcon = <&pm8916_charger>;
+ 	status = "okay";
+ };
+ 
+ &usb_hs_phy {
+-	extcon = <&pm8916_usbin>;
++	extcon = <&pm8916_charger>;
+ };
+ 
+ &wcd_codec {

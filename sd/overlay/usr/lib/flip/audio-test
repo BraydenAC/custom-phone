@@ -1,0 +1,34 @@
+#!/bin/sh
+# audio-test speaker|earpiece|headphones|mic|headset
+#   Outputs: a 3-second 440 Hz tone. Microphones: records 4 seconds, then
+#   plays the recording back on the speaker.
+# Uses the UCM profile in /usr/share/alsa/ucm2/Nokia/weeknd/.
+set -eu
+card=hw:0
+ucm() { alsaucm -c "$card" "$@" >/dev/null; }
+# alsaucm forgets its state when it exits: to switch a device off, switch it on
+# and off in one run (the on step just repeats what is already set).
+on() { ucm set _verb HiFi set _enadev "$1"; }
+off() { ucm set _verb HiFi set _enadev "$1" set _disdev "$1"; }
+tone() {
+	timeout 4 speaker-test -D plughw:0,0 -c 1 -r 48000 -t sine -f 440 -l 1 >/dev/null 2>&1 || true
+}
+case "${1:-}" in
+speaker) on Speaker; tone; off Speaker ;;
+earpiece) on Earpiece; tone; off Earpiece ;;
+headphones) on Headphones; tone; off Headphones ;;
+mic | headset)
+	dev=Mic; [ "$1" = headset ] && dev=Headset
+	rec=/run/flip-audio-test.wav
+	on "$dev"
+	echo "recording 4 s from the $1 microphone: speak now"
+	arecord -q -D plughw:0,1 -f S16_LE -r 48000 -c 1 -d 4 "$rec"
+	off "$dev"
+	on Speaker
+	echo "playing it back on the speaker"
+	aplay -q -D plughw:0,0 "$rec"
+	off Speaker
+	rm -f "$rec"
+	;;
+*) echo "usage: audio-test speaker|earpiece|headphones|mic|headset" >&2; exit 2 ;;
+esac

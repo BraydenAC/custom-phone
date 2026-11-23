@@ -1,0 +1,16 @@
+[Unit]
+Description=Use the phone's own Wi-Fi address (from the deviceinfo partition)
+# Needs only /sys, /dev (devtmpfs) and /run, all there from the start, plus
+# python3 on the root file system the kernel mounted. It must NOT wait for
+# local-fs.target: mounting /boot needs udev, which waits for this service
+# (that deadlock sent the phone to emergency mode).
+DefaultDependencies=no
+Before=systemd-udevd.service systemd-udev-trigger.service sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/flip/device-addresses
+
+[Install]
+WantedBy=sysinit.target

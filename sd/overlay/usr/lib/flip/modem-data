@@ -1,0 +1,23 @@
+#!/bin/sh
+# Ask the modem to open its data channel 0 over BAM-DMUX (the kernel then
+# creates wwan0). Without this the modem never opens a channel, so there is no
+# network port and ModemManager drops the modem ("couldn't setup data format").
+# Stock Android does the same through its data-port mapper (QMI DPM).
+#
+# The rx/tx ids must be non-zero: qmicli treats 0 as "not given" and rejects
+# the whole port ("unfinished hw data port item").
+port="ctrl-ep-type=bam-dmux,ctrl-ep-iface-number=0,ctrl-port-name=DATA5_CNTL"
+port="$port,hw-data-ep-type=bam-dmux,hw-data-ep-iface-number=0,hw-data-rx-id=1,hw-data-tx-id=1"
+
+# The modem takes a while to boot and publish its QMI services; wait for it.
+i=0
+while [ $i -lt 60 ]; do
+	if qmicli -d qrtr://0 --dpm-open-port="$port" >/dev/null 2>&1; then
+		echo "modem data channel 0 open"
+		exit 0
+	fi
+	i=$((i + 1))
+	sleep 2
+done
+echo "modem never accepted the data port request" >&2
+exit 1

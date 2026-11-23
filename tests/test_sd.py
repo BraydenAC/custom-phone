@@ -445,3 +445,73 @@ def test_partitions_reads_real_lsblk_output(tmp_path):
     for d in disks:
         for part in sd.partitions(d):
             assert part["path"].startswith(d) and part["path"] != d
+
+
+def test_phone_installs_kernel_keeping_previous_one(tmp_path):
+    import tarfile
+    root = tmp_path / "phone"
+    (root / "usr/lib/modules/6.3.0/kernel").mkdir(parents=True)
+    (root / "usr/lib/modules/6.3.0/kernel/old.ko").write_text("old")
+    boot = root / "boot"
+    boot.mkdir()
+    dtb = profile.KERNEL_DTB_NAME
+    for name, text in (("Image.gz", "old-k"), (dtb, "old-d"), ("Image.gz.new", "new-k"),
+                       (f"{dtb}.new", "new-d")):
+        (boot / name).write_text(text)
+    src = tmp_path / "mods"
+    (src / "kernel").mkdir(parents=True)
+    (src / "kernel/new.ko").write_text("new")
+    (root / "var/tmp").mkdir(parents=True)
+    sd.root_owned_tar(src, root / "var/tmp/flip-modules.tar")
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "depmod").write_text(f"#!/bin/sh\necho \"$@\" > {tmp_path}/depmod\n")
+    (bin_ / "depmod").chmod(0o755)
+    script = sd.PHONE_INSTALL_KERNEL.format(rel="6.3.0", dtb=dtb)
+    script = script.replace("/usr/lib/modules", str(root / "usr/lib/modules")).replace(
+        "/boot", str(boot)).replace("/var/tmp", str(root / "var/tmp"))
+    r = subprocess.run(["sh", "-c", script], capture_output=True, text=True,
+                       env={"PATH": f"{bin_}:/usr/bin:/bin"})
+    assert r.returncode == 0, r.stderr
+    mods = root / "usr/lib/modules"
+    assert sorted(p.name for p in mods.iterdir()) == ["6.3.0"]  # no .new/.old left behind
+    assert (mods / "6.3.0/kernel/new.ko").exists() and not (mods / "6.3.0/kernel/old.ko").exists()
+    assert (boot / "Image.gz").read_text() == "new-k" and (boot / dtb).read_text() == "new-d"
+    assert (boot / "Image.gz.prev").read_text() == "old-k"
+    assert (boot / f"{dtb}.prev").read_text() == "old-d"
+    assert (tmp_path / "depmod").read_text().split() == ["-a", "6.3.0"]
+    assert not (root / "var/tmp/flip-modules.tar").exists()
+
+
+def _device_addresses_module():
+    src = (Path(sd.SD_SRC) / "overlay/usr/lib/flip/device-addresses").read_text()
+    mod = type(sys)("device_addresses")
+    exec(compile(src, "device-addresses", "exec"), mod.__dict__)
+    return mod
+
+
+def test_reads_wifi_address_from_deviceinfo_records():
+    import struct
+    mod = _device_addresses_module()
+
+    def record(name: bytes, value: bytes) -> bytes:
+        return name.ljust(32, b"\0") + struct.pack("<I", len(value)) + value.ljust(44, b"\0")
+
+    data = (b"\0" * 4272 + record(b"PRODUCTID", b"SERIAL123") + record(b"BTADDR", b"AABBCCDDEEFF")
+            + record(b"MACADDR", b"1C3B62000001") + record(b"IMEI", b"123456789012345"))
+    assert mod.read_addresses(data) == {"wlan": "1c:3b:62:00:00:01"}
+    assert mod.read_addresses(b"\0" * 8192) == {}
+    # a value that isn't an address is ignored
+    assert mod.read_addresses(record(b"MACADDR", b"not-a-mac!!!")) == {}
+
+
+def test_early_units_dont_wait_for_mounts():
+    """A unit that udev waits for must not wait for local-fs.target: /boot's mount
+    needs udev, so that deadlocks and boot ends in emergency mode."""
+    for unit in (Path(sd.SD_SRC) / "overlay/etc/systemd/system").glob("*.service"):
+        text = unit.read_text()
+        before = " ".join(l.split("=", 1)[1] for l in text.splitlines() if l.startswith("Before="))
+        after = " ".join(l.split("=", 1)[1] for l in text.splitlines() if l.startswith("After="))
+        if "systemd-udevd.service" in before or "systemd-udev-trigger.service" in before:
+            assert "local-fs.target" not in after, unit.name
+            assert "DefaultDependencies=no" in text, unit.name

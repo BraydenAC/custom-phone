@@ -55,11 +55,28 @@ def step(n: int, name: str) -> None:
 
 # --- kernel ------------------------------------------------------------------
 
+def linux_patches() -> list[Path]:
+    return sorted((config.PATCHES / "linux").glob("*.patch"))
+
+
 def kernel_fingerprint(pins: lock.Lock) -> str:
     return fingerprint(
-        f"kernel-v2 {pins.git['linux'].commit} {config.cross_compile()}",
-        [config.DEFCONFIG],
+        f"kernel-v3 {pins.git['linux'].commit} {config.cross_compile()}",
+        [config.DEFCONFIG, *linux_patches()],
     )
+
+
+def apply_linux_patches() -> None:
+    """Put the pinned kernel source back to its commit, then apply patches/linux/.
+
+    Only tracked files are reset (git checkout rewrites just the ones that
+    differ), so the in-tree build stays incremental. Local edits in linux/ are
+    discarded: put changes in patches/linux/ instead.
+    """
+    run(["git", "checkout", "-q", "--", "."], cwd=config.LINUX_DIR)
+    for patch in linux_patches():
+        say(f"applying {patch.name}")
+        run(["git", "apply", patch], cwd=config.LINUX_DIR)
 
 
 def build_kernel(pins: lock.Lock, jobs: int) -> None:
@@ -72,6 +89,7 @@ def build_kernel(pins: lock.Lock, jobs: int) -> None:
         return
     if OUT.kernel.exists():
         say("kernel inputs changed, rebuilding")
+    apply_linux_patches()
     shutil.copyfile(config.DEFCONFIG, config.LINUX_DIR / ".config")
     env = {"ARCH": "arm64", "CROSS_COMPILE": config.cross_compile()}
     # defconfig was saved with GCC 12.2; fill in options a newer compiler adds

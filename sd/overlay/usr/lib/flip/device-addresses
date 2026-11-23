@@ -1,0 +1,64 @@
+#!/usr/bin/python3
+"""Give Wi-Fi the phone's own MAC address (wcn36xx otherwise picks a random one).
+
+The address is on the eMMC's "deviceinfo" partition, written at the factory.
+That partition is a list of 80-byte records: a 32-byte NUL-padded name, a
+little-endian u32 length, then the value as text ("MACADDR" -> 1C3B62...).
+It also holds the IMEI and serial number; only the address records are read.
+
+Writes a systemd .link file to /run, so udev applies the address when the
+Wi-Fi interface appears. Runs before udev starts (flip-device-addresses.service).
+"""
+import re
+import struct
+import sys
+from pathlib import Path
+
+RECORD = 80
+WANTED = {b"MACADDR": "wlan"}
+LINK = Path("/run/systemd/network/10-flip-wlan.link")
+
+
+def partition(name: str) -> Path | None:
+    for uevent in Path("/sys/class/block").glob("*/uevent"):
+        fields = dict(line.split("=", 1) for line in uevent.read_text().split("\n") if "=" in line)
+        if fields.get("PARTNAME") == name:
+            return Path("/dev") / fields["DEVNAME"]
+    return None
+
+
+def read_addresses(data: bytes) -> dict[str, str]:
+    found = {}
+    for off in range(0, len(data) - RECORD + 1, 4):
+        name = data[off:off + 32].rstrip(b"\0")
+        if name not in WANTED or data[off + 32 - 1] != 0:
+            continue
+        (length,) = struct.unpack_from("<I", data, off + 32)
+        value = data[off + 36:off + 36 + length].decode("ascii", "replace")
+        if re.fullmatch(r"[0-9A-Fa-f]{12}", value):
+            found[WANTED[name]] = ":".join(value[i:i + 2] for i in range(0, 12, 2)).lower()
+    return found
+
+
+def main() -> int:
+    dev = partition("deviceinfo")
+    if dev is None:
+        print("no deviceinfo partition; keeping the driver's address", file=sys.stderr)
+        return 0
+    with open(dev, "rb") as f:
+        addresses = read_addresses(f.read(64 * 1024))
+    mac = addresses.get("wlan")
+    if not mac:
+        print("no Wi-Fi address in deviceinfo; keeping the driver's address", file=sys.stderr)
+        return 0
+    LINK.parent.mkdir(parents=True, exist_ok=True)
+    LINK.write_text(
+        "# Written at boot by /usr/lib/flip/device-addresses\n"
+        "[Match]\nDriver=wcn36xx\n\n"
+        f"[Link]\nNamePolicy=keep kernel\nMACAddressPolicy=none\nMACAddress={mac}\n")
+    print(f"Wi-Fi address {mac}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

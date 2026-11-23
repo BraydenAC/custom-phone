@@ -63,7 +63,7 @@ SD_PACKAGES = [
     # system
     "systemd-sysv", "udev", "dbus", "libpam-systemd", "kmod",
     "systemd-zram-generator", "procps", "less", "nano", "e2fsprogs", "fdisk", "kbd",
-    "tzdata", "ca-certificates", "unattended-upgrades",
+    "tzdata", "ca-certificates", "unattended-upgrades", "systemd-timesyncd", "iproute2",
     # flipd
     "python3", "python3-cryptography",
     # networking (outgoing only; nftables drops everything incoming)
@@ -72,5 +72,5 @@ SD_PACKAGES = [
     # audio
     "alsa-utils", "alsa-ucm-conf",
     # modem (installed but switched off until it's brought up deliberately)
-    "rmtfs", "tqftpserv", "qrtr-tools", "modemmanager",
+    "rmtfs", "tqftpserv", "qrtr-tools", "modemmanager", "libqmi-utils",
 ]

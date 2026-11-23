@@ -28,18 +28,18 @@ rm -f /etc/apt/sources.list
 KVER="$(ls /usr/lib/modules)"
 depmod "$KVER"
 
-systemctl enable flip-gadget.service flip-panel.service nftables.service NetworkManager.service
+systemctl enable flip-gadget.service flip-panel.service flip-device-addresses.service nftables.service NetworkManager.service
 if [ "$DEBUG" = 1 ]; then
 	systemctl enable serial-getty@ttyGS0.service
 else
 	systemctl enable flipd.service
 fi
 
-# Modem helpers stay off until the modem is brought up deliberately: rmtfs
-# writes the modem's own partitions (modemst1/2) on the phone's eMMC.
-for unit in rmtfs.service tqftpserv.service ModemManager.service; do
-	systemctl disable "$unit" 2>/dev/null || true
-done
+# Modem: rmtfs serves (and writes) the modem's own partitions modemst1/2 on
+# the eMMC, tqftpserv serves its firmware/config files, flip-modem-data opens
+# the data channel, then ModemManager takes over. The stock modem partitions
+# were backed up before any of this ran.
+systemctl enable rmtfs.service tqftpserv.service flip-modem-data.service ModemManager.service
 
 apt-get clean
 rm -rf /var/lib/apt/lists/*

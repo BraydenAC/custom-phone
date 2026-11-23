@@ -91,6 +91,9 @@ def phone_identity():
     return key, path
 
 
+GPU_FIRMWARE = ("a300_pfp.fw", "a300_pm4.fw")
+
+
 def extract_firmware(backup_dir: Path, dest: Path) -> list[str]:
     """Copy the phone's own firmware out of a backup into dest (lib/firmware layout)."""
     parts = backup_dir / "parts"
@@ -103,6 +106,11 @@ def extract_firmware(backup_dir: Path, dest: Path) -> list[str]:
     # (wcnss), audio DSP (adsp) and more, as image/*.mdt + .bNN files.
     run(["mcopy", "-n", "-m", "-i", modem, "::image/*", dest], quiet=True,
         env={"MTOOLS_SKIP_CHECK": "1"})
+    # Carrier configurations (MCFG) the modem asks tqftpserv for at boot, as
+    # /readonly/firmware/image/modem_pr/mcfg/...: a directory tree, so copy it
+    # recursively (the line above only copies files).
+    run(["mcopy", "-s", "-n", "-m", "-i", modem, "::image/modem_pr", dest], quiet=True,
+        env={"MTOOLS_SKIP_CHECK": "1"})
     # Wi-Fi calibration data lives on the persist partition (ext4).
     nv = dest / "wlan/prima/WCNSS_qcom_wlan_nv.bin"
     nv.parent.mkdir(parents=True, exist_ok=True)
@@ -110,12 +118,20 @@ def extract_firmware(backup_dir: Path, dest: Path) -> list[str]:
         capture=True)
     if not nv.exists() or nv.stat().st_size == 0:
         raise FlipError("WCNSS_qcom_wlan_nv.bin not found on the persist partition")
+    # GPU (Adreno 308) microcode lives on the vendor partition (ext4).
+    vendor = parts / "vendor.img"
+    if vendor.exists():
+        for name in GPU_FIRMWARE:
+            run(["debugfs", "-R", f"dump /firmware/{name} {dest / name}", vendor], quiet=True,
+                capture=True)
+    else:
+        warn(f"{vendor} missing: no GPU firmware (the GPU stays off)")
     # mcopy names: lowercase what FAT may report in upper case.
     for f in list(dest.iterdir()):
         if f.is_file() and f.name != f.name.lower():
             f.rename(f.with_name(f.name.lower()))
     files = sorted(str(p.relative_to(dest)) for p in dest.rglob("*") if p.is_file())
-    for name in ("mba.mbn", "modem.mdt", "wcnss.mdt", "adsp.mdt"):
+    for name in ("mba.mbn", "modem.mdt", "wcnss.mdt", "adsp.mdt", *GPU_FIRMWARE):
         if name not in files:
             warn(f"firmware {name} not found in the modem partition")
     return files
@@ -576,6 +592,9 @@ def partitions_by_label(dev: str, wait: float = 15) -> dict[str, dict]:
 def update_card(dev: str | None, confirm) -> None:
     """Replace kernel, device tree and modules on a flip card; keep everything else."""
     in_phone = dev is None
+    if dev is None and phone.client.find_ports():
+        update_over_link(confirm)
+        return
     if dev is None:
         dev = phone_card(confirm)
     if not Path(dev).is_block_device():
@@ -617,6 +636,80 @@ def update_card(dev: str | None, confirm) -> None:
         say("card updated. The phone is starting Linux from it.")
     else:
         say("card updated")
+
+
+# --- updating the running phone over flip-link -----------------------------------
+
+# Runs on the phone after the files are uploaded. The previous kernel and device
+# tree stay on the boot partition as *.prev for a manual rollback.
+PHONE_INSTALL_KERNEL = """set -eu
+rel={rel}; dtb={dtb}; tar=/var/tmp/flip-modules.tar
+cd /usr/lib/modules
+rm -rf "$rel.new" "$rel.old"
+mkdir "$rel.new"
+tar -xf "$tar" -C "$rel.new" --no-same-owner
+rm -f "$tar"
+if [ -d "$rel" ]; then mv "$rel" "$rel.old"; fi
+mv "$rel.new" "$rel"
+depmod -a "$rel"
+cd /boot
+cp -p Image.gz Image.gz.prev
+cp -p "$dtb" "$dtb.prev"
+mv Image.gz.new Image.gz
+mv "$dtb.new" "$dtb"
+sync
+rm -rf "/usr/lib/modules/$rel.old"
+"""
+REBOOT_WAIT = 150  # seconds for Linux shutdown + bootloader + Debian start
+
+
+def update_over_link(confirm) -> None:
+    """Install out/'s kernel, device tree and modules on the running phone, then restart it."""
+    release = build.OUT.kernel_release.read_text().strip()
+    modules = build.OUT.modules / "lib/modules" / release
+    for f in (build.OUT.kernel_image, build.OUT.dtb, modules):
+        if not f.exists():
+            raise FlipError(f"{f} is missing: run `flip build`")
+    if not confirm(f"install kernel {release}, its device tree and modules on the phone "
+                   "(over the USB link) and restart it?"):
+        raise FlipError("aborted")
+    tar = root_owned_tar(modules, SD / "modules.tar")
+    try:
+        uploads = [(build.OUT.kernel_image, "/boot/Image.gz.new"),
+                   (build.OUT.dtb, f"/boot/{profile.KERNEL_DTB_NAME}.new"),
+                   (tar, "/var/tmp/flip-modules.tar")]
+        for local, remote in uploads:
+            say(f"uploading {local.name} ({local.stat().st_size // 1024} KiB)")
+            with phone.session() as s:
+                s.push(local, remote)
+    finally:
+        tar.unlink(missing_ok=True)
+    say("installing")
+    _phone_sh(PHONE_INSTALL_KERNEL.format(rel=release, dtb=profile.KERNEL_DTB_NAME))
+    restart_phone_linux()
+
+
+def restart_phone_linux() -> None:
+    """Restart the phone into the card's Linux (via lk2nd) and wait for flip-link."""
+    say("restarting the phone")
+    _phone_sh(f"systemd-run --quiet --on-active=2 {REBOOT_TO_LK2ND}")
+    deadline = time.monotonic() + REBOOT_WAIT
+    while phone.client.find_ports():  # wait for it to go away
+        if time.monotonic() > deadline:
+            raise FlipError("the phone didn't restart")
+        time.sleep(1)
+    while not phone.client.find_ports():
+        if time.monotonic() > deadline:
+            raise FlipError(
+                f"the phone didn't come back within {REBOOT_WAIT} s. If the screen shows "
+                "the toolbox or nothing, the new kernel may not boot: start the toolbox, "
+                "choose '5. SD to computer', and restore /boot/Image.gz.prev and "
+                f"/boot/{profile.KERNEL_DTB_NAME}.prev.")
+        time.sleep(1)
+    time.sleep(3)  # flipd starts just after the USB gadget
+    with phone.session() as s:
+        info = s.call("info")
+    say(f"phone is back: kernel {info['kernel']}, up {int(info['uptime'])} s")
 
 
 # --- the card while it's in the phone ------------------------------------------

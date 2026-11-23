@@ -1,0 +1,14 @@
+[Unit]
+Description=Open the modem's data channel (so ModemManager can use it)
+# rmtfs serves the modem's storage; the modem boots once it is up.
+Wants=rmtfs.service tqftpserv.service
+After=rmtfs.service tqftpserv.service
+Before=ModemManager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/flip/modem-data
+
+[Install]
+WantedBy=multi-user.target
