@@ -28,7 +28,8 @@ rm -f /etc/apt/sources.list
 KVER="$(ls /usr/lib/modules)"
 depmod "$KVER"
 
-systemctl enable flip-gadget.service flip-panel.service flip-device-addresses.service nftables.service NetworkManager.service
+systemctl enable flip-gadget.service flip-panel.service flip-splash.service flip-device-addresses.service nftables.service NetworkManager.service
+systemctl enable flip-splash-shutdown@poweroff.service flip-splash-shutdown@reboot.service
 if [ "$DEBUG" = 1 ]; then
 	systemctl enable serial-getty@ttyGS0.service
 else

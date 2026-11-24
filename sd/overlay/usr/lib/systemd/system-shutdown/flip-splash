@@ -1,0 +1,18 @@
+#!/bin/sh
+# Last step before the power goes off (systemd-shutdown runs this, $1 =
+# poweroff/reboot/...): let the shutdown animation (flip-splash-shutdown@)
+# finish -- it may be asking for the USB cable to come out. At most 20 s.
+i=0
+while [ $i -lt 100 ]; do
+	running=
+	for c in /proc/[0-9]*/cmdline; do
+		if grep -aq '^@flip-splash' "$c" 2>/dev/null; then
+			running=1
+			break
+		fi
+	done
+	[ -n "$running" ] || exit 0
+	sleep 0.2
+	i=$((i + 1))
+done
+exit 0

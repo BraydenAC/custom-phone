@@ -14,9 +14,11 @@ TOOLBOX_SD_MODEL = "flip SD card"
 
 # Partition sizes (from `fastboot getvar all` on the reference phone)
 RECOVERY_SIZE = 0x3000000  # 48 MiB
+BOOT_SIZE = 0x2000000  # 32 MiB
+DTBO_SIZE = 0x800000  # 8 MiB
 VBMETA_SIZE = 0x10000  # 64 KiB
 
-# lk2nd occupies the first 512 KiB of recovery (LK2ND_PARTITION_SIZE); the
+# lk2nd occupies the first 512 KiB of its partition (LK2ND_PARTITION_SIZE); the
 # toolbox boot image follows at that offset.
 LK2ND_SLOT = 512 * 1024
 
@@ -29,15 +31,37 @@ KERNEL_DTB_NAME = "qm215-nokia-weeknd.dtb"
 # the recovery partition (on the phone) before relying on a feature.
 #   2: shares the SD card on request (sd.request_card_share) and restarts into
 #      the card's Linux when the computer ejects it.
-TOOLBOX_VERSION = 2
-BOOT_CMDLINE = f"console=tty1 rw loglevel=7 fbcon=font:10x18 flip_toolbox={TOOLBOX_VERSION}"
+#   3: knows the boot layout (flip_layout=, below) and can start KaiOS.
+TOOLBOX_VERSION = 3
+
+# Where things live. The phone's own bootloader (signed, can't be changed)
+# starts the boot partition normally and the recovery partition when volume-up
+# is held at power-on (or after `reboot recovery`).
+#   kaios-first: boot = KaiOS, recovery = lk2nd + toolbox (first install).
+#   linux-first: boot = lk2nd + toolbox, recovery = KaiOS (from your backup).
+# lk2nd boots the SD card's Linux if it finds one, else the toolbox.
+LAYOUTS = ("kaios-first", "linux-first")
+
+
+def boot_cmdline(layout: str) -> str:
+    """The toolbox's kernel command line; flip and the toolbox read the markers."""
+    return (f"console=tty1 rw loglevel=7 fbcon=font:10x18 flip_toolbox={TOOLBOX_VERSION} "
+            f"flip_layout={layout}")
 
 LK2ND_TARGET = "lk2nd-msm8952"
-LK2ND_MAKE_ARGS = [
-    "LK2ND_PARTITION_BASE=recovery",
-    # patches/lk2nd/0001-*: boot the toolbox when no extlinux system is found
-    "LK2ND_FALLBACK_RECOVERY=1",
-]
+LK2ND_MAKE_ARGS = {
+    "kaios-first": [
+        "LK2ND_PARTITION_BASE=recovery",
+        # patches/lk2nd/0001-*: boot the toolbox when no extlinux system is found
+        "LK2ND_FALLBACK_RECOVERY=1",
+    ],
+    "linux-first": [
+        # lk2nd's default: the toolbox is the rest of boot, its fallback anyway
+        "LK2ND_PARTITION_BASE=boot",
+        # patches/lk2nd/0003-*: volume-up as lk2nd starts = toolbox, not KaiOS
+        "LK2ND_RECOVERY_KEY_TOOLBOX=1",
+    ],
+}
 
 # Device tree overlays in the recovery_dtbo section. Kept because that image
 # layout is the one proven to boot from recovery on this phone.

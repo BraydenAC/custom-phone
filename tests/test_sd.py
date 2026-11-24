@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -257,12 +258,16 @@ def test_toolbox_and_flip_agree():
     assert len(inquiry) == 28  # SCSI vendor 8 + product 16 + revision 4
     assert inquiry[8:24].strip() == profile.TOOLBOX_SD_MODEL
     assert f"SD_REQUEST={sd.SHARE_REQUEST}\n" in init
-    assert f"flip_toolbox={profile.TOOLBOX_VERSION}" in profile.BOOT_CMDLINE
-    assert profile.TOOLBOX_VERSION >= 2
+    for layout in profile.LAYOUTS:
+        cmdline = profile.boot_cmdline(layout)
+        assert f"flip_toolbox={profile.TOOLBOX_VERSION}" in cmdline
+        assert f"flip_layout={layout}" in cmdline
+        assert f"flip_layout={layout}" in init or layout == "kaios-first"  # init's default
+    assert profile.TOOLBOX_VERSION >= 3
 
 
 def _fake_phone(tmp_path, monkeypatch, schedule_ok=True, dry_run_ok=True, reboot_ok=True):
-    """sh, with /boot and the recovery partition redirected into tmp_path.
+    """sh, with /boot and the phone's partitions redirected into tmp_path.
 
     systemd-run runs its command straight away; systemctl logs its arguments."""
     bin_ = tmp_path / "bin"
@@ -277,11 +282,15 @@ def _fake_phone(tmp_path, monkeypatch, schedule_ok=True, dry_run_ok=True, reboot
     for f in bin_.iterdir():
         f.chmod(0o755)
     (tmp_path / "boot/extlinux").mkdir(parents=True)
+    (tmp_path / "parts").mkdir()
+    for part in ("boot", "recovery"):  # KaiOS-like: no flip markers
+        (tmp_path / "parts" / part).write_bytes(b"ANDROID!" + b"\0" * 9000)
     (tmp_path / "boot/extlinux/extlinux.conf").write_text("default flip\n")
 
     def sh(script):
-        script = script.replace("/boot", str(tmp_path / "boot")).replace(
-            "/dev/disk/by-partlabel/recovery", str(tmp_path / "recovery"))
+        # /boot alone, not the end of /dev/disk/by-partlabel/boot
+        script = re.sub(r"(?<![\w-])/boot", str(tmp_path / "boot"), script)
+        script = script.replace("/dev/disk/by-partlabel/", str(tmp_path / "parts") + "/")
         return subprocess.run(["sh", "-c", script], capture_output=True, text=True,
                               env={"PATH": f"{bin_}:/usr/bin:/bin"})
     return sh
@@ -295,27 +304,37 @@ def _boot_state(tmp_path):
     return (ext / "extlinux.conf").exists(), (ext / REQ).exists()
 
 
-def test_phone_reads_flashed_toolbox_version(tmp_path, monkeypatch):
+def _flash_toolbox(tmp_path, layout, cmdline=None):
+    """Put lk2nd + a toolbox header where `layout` keeps it."""
+    part = "boot" if layout == "linux-first" else "recovery"
+    header = b"ANDROID!" + b"\0" * 56 + (cmdline or profile.boot_cmdline(layout)).encode()
+    (tmp_path / "parts" / part).write_bytes(
+        b"\x7fLK" * 1000 + b"\0" * (profile.LK2ND_SLOT - 3000) + header + b"\0" * 9000)
+
+
+@pytest.mark.parametrize("layout", profile.LAYOUTS)
+def test_phone_reads_flashed_toolbox_version(tmp_path, monkeypatch, layout):
     sh = _fake_phone(tmp_path, monkeypatch)
     script = sd.PHONE_TOOLBOX_VERSION.format(end=sd.TOOLBOX_HEADER_END)
-    header = b"ANDROID!" + b"\0" * 56 + profile.BOOT_CMDLINE.encode()
-    (tmp_path / "recovery").write_bytes(b"\x7fLK" * 1000 + b"\0" * (profile.LK2ND_SLOT - 3000)
-                                        + header + b"\0" * 9000)
+    _flash_toolbox(tmp_path, layout)
     assert sh(script).stdout.strip() == str(profile.TOOLBOX_VERSION)
-    old = header.replace(f" flip_toolbox={profile.TOOLBOX_VERSION}".encode(), b"")
-    (tmp_path / "recovery").write_bytes(b"\0" * profile.LK2ND_SLOT + old)
+    _flash_toolbox(tmp_path, layout, cmdline="console=tty1 rw")  # before markers
     assert sh(script).stdout.strip() == "0"
 
 
-def test_phone_hides_boot_config_then_reboots_to_lk2nd(tmp_path, monkeypatch):
+@pytest.mark.parametrize("layout,reboot", [
+    # systemd 257 rejects `systemctl reboot recovery`; the reason must be an option
+    ("kaios-first", "reboot --reboot-argument=recovery"),
+    ("linux-first", "reboot"),  # lk2nd is in boot: a plain restart
+])
+def test_phone_hides_boot_config_then_reboots_to_lk2nd(tmp_path, monkeypatch, layout, reboot):
     sh = _fake_phone(tmp_path, monkeypatch)
+    _flash_toolbox(tmp_path, layout)
     assert sh(sd.PHONE_REQUEST_SHARE.format(req=REQ)).returncode == 0
     assert _boot_state(tmp_path) == (False, True)
     assert (tmp_path / "boot/extlinux" / REQ).read_text() == "default flip\n"
-    # systemd 257 rejects `systemctl reboot recovery`; the reason must be an option
     calls = (tmp_path / "systemctl").read_text().splitlines()
-    assert calls == ["reboot --reboot-argument=recovery --dry-run",
-                     "reboot --reboot-argument=recovery"]
+    assert calls == [f"{reboot} --dry-run", reboot]
 
 
 @pytest.mark.parametrize("fail", ["dry_run_ok", "schedule_ok", "reboot_ok"])
@@ -515,3 +534,30 @@ def test_early_units_dont_wait_for_mounts():
         if "systemd-udevd.service" in before or "systemd-udev-trigger.service" in before:
             assert "local-fs.target" not in after, unit.name
             assert "DefaultDependencies=no" in text, unit.name
+
+
+def test_restart_waits_for_flipd_after_usb_appears(monkeypatch):
+    """The USB port comes back before flipd answers; a busy startup made that
+    gap long enough to fail the restart."""
+    from contextlib import contextmanager
+    ports = iter([["/dev/ttyACM0"], [], [], ["/dev/ttyACM0"]])
+    monkeypatch.setattr(sd.phone.client, "find_ports", lambda: next(ports))
+    monkeypatch.setattr(sd, "_phone_sh", lambda script: "")
+    monkeypatch.setattr(sd.time, "sleep", lambda s: None)
+    answers = iter([FlipError("no answer from the phone"), FlipError("no answer"),
+                    {"kernel": "6.3", "uptime": 12}])
+
+    class S:
+        def call(self, name):
+            a = next(answers)
+            if isinstance(a, Exception):
+                raise a
+            return a
+
+    @contextmanager
+    def session():
+        yield S()
+
+    monkeypatch.setattr(sd.phone, "session", session)
+    sd.restart_phone_linux()
+    assert next(answers, None) is None  # it kept asking until flipd answered

@@ -11,7 +11,7 @@ from flip.util import FlipError
 
 def test_recovery_layout():
     head, boot = b"L" * 1000, b"B" * 5000
-    img = images.assemble_recovery(head, boot)
+    img = images.assemble_lk2nd_toolbox(head, boot)
     assert img[:1000] == head
     assert img[1000:profile.LK2ND_SLOT] == b"\0" * (profile.LK2ND_SLOT - 1000)
     assert img[profile.LK2ND_SLOT:] == boot
@@ -19,9 +19,9 @@ def test_recovery_layout():
 
 def test_recovery_size_checks():
     with pytest.raises(FlipError, match="slot"):
-        images.assemble_recovery(b"L" * (profile.LK2ND_SLOT + 1), b"B")
+        images.assemble_lk2nd_toolbox(b"L" * (profile.LK2ND_SLOT + 1), b"B")
     with pytest.raises(FlipError, match="recovery partition"):
-        images.assemble_recovery(b"L", b"B" * profile.RECOVERY_SIZE)
+        images.assemble_lk2nd_toolbox(b"L", b"B" * profile.RECOVERY_SIZE)
 
 
 def _sample_tree(tmp_path):
@@ -83,3 +83,40 @@ def test_toolbox_contains_init_and_applets(tmp_path):
     paths = {e.path for e in build.toolbox_entries(bb, rm)}
     assert {"init", "sbin/busybox", "sbin/reboot", "sbin/sync", "sbin/mv",
             "sbin/reboot-mode"} <= paths
+
+
+def _stock_boot(cmdline=b"console=ttyMSM0 buildvariant=user", page=2048, kernel=b"K" * 5000):
+    import struct
+    hdr = bytearray(page)
+    hdr[:8] = b"ANDROID!"
+    struct.pack_into("<10I", hdr, 8, len(kernel), 0x80008000, 0, 0x81000000, 0, 0x80f00000,
+                     0x80000100, page, 1, 0)
+    hdr[64:64 + len(cmdline)] = cmdline
+    struct.pack_into("<I", hdr, 1644, 1648)
+    return bytes(hdr) + kernel.ljust(6144, b"\0") + b"\0" * 100000  # partition padding
+
+
+def _stock_dtbo(size=3000):
+    import struct
+    return struct.pack(">II", images.DTBO_MAGIC, size) + b"o" * (size - 8) + b"\0" * 5000
+
+
+def test_kaios_for_recovery_embeds_stock_overlays_and_root():
+    import struct
+    img = images.kaios_for_recovery(_stock_boot(), _stock_dtbo(), "ABCD-EF")
+    size, offset = struct.unpack_from("<IQ", img, 1632)
+    assert (size, offset) == (3000, 2048 + 6144)
+    assert img[offset:offset + size] == _stock_dtbo()[:3000]
+    assert img[2048:2048 + 5000] == b"K" * 5000
+    assert len(img) % 2048 == 0 and len(img) == 2048 + 6144 + 4096  # no partition padding
+    cmdline = img[64:576].split(b"\0")[0].decode()
+    assert cmdline.endswith("buildvariant=user root=PARTUUID=abcd-ef rootwait")
+
+
+def test_kaios_for_recovery_rejects_unexpected_images():
+    with pytest.raises(FlipError):
+        images.kaios_for_recovery(b"X" * 4096, _stock_dtbo(), "u")
+    with pytest.raises(FlipError):
+        images.kaios_for_recovery(_stock_boot(), b"\0" * 64, "u")
+    with pytest.raises(FlipError, match="too long"):
+        images.kaios_for_recovery(_stock_boot(cmdline=b"x" * 490), _stock_dtbo(), "u")

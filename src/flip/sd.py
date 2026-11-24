@@ -706,9 +706,17 @@ def restart_phone_linux() -> None:
                 "choose '5. SD to computer', and restore /boot/Image.gz.prev and "
                 f"/boot/{profile.KERNEL_DTB_NAME}.prev.")
         time.sleep(1)
-    time.sleep(3)  # flipd starts just after the USB gadget
-    with phone.session() as s:
-        info = s.call("info")
+    # flipd starts after the USB gadget; how long after depends on how busy
+    # startup is, so keep asking until the deadline.
+    while True:
+        time.sleep(3)
+        try:
+            with phone.session() as s:
+                info = s.call("info")
+            break
+        except FlipError:
+            if time.monotonic() > deadline:
+                raise
     say(f"phone is back: kernel {info['kernel']}, up {int(info['uptime'])} s")
 
 
@@ -722,13 +730,21 @@ SHARE_WAIT = 180  # seconds: Linux shutdown + bootloader warning + toolbox start
 # lk2nd, then the toolbox boot image (with its command line in the header).
 TOOLBOX_HEADER_END = profile.LK2ND_SLOT + 4096
 
+# The toolbox is in boot (linux-first layout) or recovery (kaios-first); the
+# other partition holds KaiOS, which has no marker.
 PHONE_TOOLBOX_VERSION = (
-    "v=$(head -c {end} /dev/disk/by-partlabel/recovery | grep -ao 'flip_toolbox=[0-9]*' "
-    "| head -n 1 | cut -d= -f2); echo \"${{v:-0}}\"")
-# Rename, then reboot with the reason that makes the bootloader start lk2nd
-# (pm8916 pon reboot-mode). The reboot is checked first (--dry-run), runs 2 s
-# later so the reply gets back, and puts the file back if it fails after all.
-REBOOT_TO_LK2ND = "systemctl reboot --reboot-argument=recovery"
+    "for p in boot recovery; do v=$(head -c {end} /dev/disk/by-partlabel/$p "
+    "| grep -ao 'flip_toolbox=[0-9]*' | head -n 1 | cut -d= -f2); [ -n \"$v\" ] && break; "
+    "done; echo \"${{v:-0}}\"")
+# Restart into lk2nd. linux-first: a plain reboot (the bootloader starts boot).
+# kaios-first: the "recovery" reason (pm8916 pon reboot-mode) makes the
+# bootloader start recovery. Decided on the phone, from the boot partition's
+# marker. No braces or single quotes: it's used inside sh -c '...' and format().
+REBOOT_TO_LK2ND = (
+    f"systemctl reboot $(head -c {TOOLBOX_HEADER_END} /dev/disk/by-partlabel/boot "
+    "| grep -aq flip_layout=linux-first || echo --reboot-argument=recovery)")
+# Rename, then restart into lk2nd. The reboot is checked first (--dry-run), runs
+# 2 s later so the reply gets back, and puts the file back if it fails after all.
 PHONE_REQUEST_SHARE = (
     "set -eu; mountpoint -q /boot; cd /boot/extlinux; test -f extlinux.conf; "
     f"{REBOOT_TO_LK2ND} --dry-run; "
@@ -777,7 +793,7 @@ def phone_card(confirm) -> str:
             "the phone isn't connected. Either:\n"
             "   - start Linux from the SD card and plug in USB (flip restarts it into "
             "the toolbox), or\n"
-            "   - start the toolbox (volume-up at power-on, held past the warning) and "
+            "   - start the toolbox (see README, Booting) and "
             "choose '5. SD to computer', or\n"
             "   - put the card in this computer and give its device, e.g. /dev/mmcblk0")
     version = _phone_sh(PHONE_TOOLBOX_VERSION.format(end=TOOLBOX_HEADER_END))
@@ -811,9 +827,8 @@ def phone_card(confirm) -> str:
                 + ". See `flip phone run -- journalctl -b -n 50`.")
     raise FlipError(
         f"the phone didn't share its SD card within {SHARE_WAIT} s. If it shows KaiOS, it "
-        "didn't restart into lk2nd: power it off, then hold volume-up while powering on and "
-        "release it at the warning. The toolbox then shares the card by itself; run this "
-        "again.")
+        "didn't restart into lk2nd: power it off and start the toolbox (README, Booting). "
+        "It then shares the card by itself; run this again.")
 
 
 def release_card(dev: str) -> None:

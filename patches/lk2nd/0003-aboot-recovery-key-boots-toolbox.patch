@@ -1,0 +1,59 @@
+From: flip
+Subject: [PATCH] aboot: optionally boot the toolbox on the recovery key
+
+For lk2nd in the boot partition (LK2ND_PARTITION_BASE=boot) with the stock
+OS moved to recovery: lk2nd cannot boot the stock kernel, so with
+LK2ND_RECOVERY_KEY_TOOLBOX=1 the recovery key (volume-up as lk2nd starts)
+skips the extlinux scan and boots the rest of the boot partition (the
+toolbox) instead of the recovery partition.
+
+Applies on top of 0001.
+---
+diff --git i/app/aboot/aboot.c w/app/aboot/aboot.c
+--- i/app/aboot/aboot.c
++++ w/app/aboot/aboot.c
+@@ -4679,6 +4679,15 @@
+ 			dprintf(INFO, "boot: Falling back to the recovery partition.\n");
+ #endif
+ 		}
++#if LK2ND_RECOVERY_KEY_TOOLBOX
++		else {
++			/* The recovery partition holds the stock OS, which lk2nd
++			 * cannot boot: the recovery key means "skip the scan and
++			 * boot the toolbox" (the part of boot after lk2nd). */
++			boot_into_recovery = 0;
++			dprintf(INFO, "boot: Recovery key: booting the toolbox.\n");
++		}
++#endif
+ #endif
+ 		boot_linux_from_mmc();
+ 	}
+@@ -5669,6 +5678,15 @@
+ 			dprintf(INFO, "boot: Falling back to the recovery partition.\n");
+ #endif
+ 		}
++#if LK2ND_RECOVERY_KEY_TOOLBOX
++		else {
++			/* The recovery partition holds the stock OS, which lk2nd
++			 * cannot boot: the recovery key means "skip the scan and
++			 * boot the toolbox" (the part of boot after lk2nd). */
++			boot_into_recovery = 0;
++			dprintf(INFO, "boot: Recovery key: booting the toolbox.\n");
++		}
++#endif
+ #endif
+ 
+ 		if (target_is_emmc_boot())
+diff --git i/lk2nd/project/base.mk w/lk2nd/project/base.mk
+--- i/lk2nd/project/base.mk
++++ w/lk2nd/project/base.mk
+@@ -57,6 +57,9 @@
+ ifeq ($(LK2ND_FALLBACK_RECOVERY), 1)
+ 	DEFINES += LK2ND_FALLBACK_RECOVERY=1
+ endif
++ifeq ($(LK2ND_RECOVERY_KEY_TOOLBOX), 1)
++	DEFINES += LK2ND_RECOVERY_KEY_TOOLBOX=1
++endif
+ 
+ ifdef LK2ND_FASTBOOT_DELAY
+ 	DEFINES += LK2ND_FASTBOOT_DELAY=$(LK2ND_FASTBOOT_DELAY)

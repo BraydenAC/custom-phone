@@ -2,8 +2,9 @@
  *
  * reboot-mode MODE: restart with a reboot reason, like `reboot MODE` on
  * Android. Busybox's reboot can't pass one. The phone's bootloader reads it
- * from the PMIC (pm8916 pon reboot-mode): "recovery" starts lk2nd, which boots
- * the SD card's Linux; "bootloader" is stock fastboot.
+ * from the PMIC (pm8916 pon reboot-mode): "recovery" starts the recovery
+ * partition (lk2nd in the kaios-first layout, KaiOS in linux-first);
+ * "bootloader" is stock fastboot.
  *
  * Built against the kernel tree's nolibc (no C library needed):
  *   gcc -static -nostdlib -include tools/include/nolibc/nolibc.h

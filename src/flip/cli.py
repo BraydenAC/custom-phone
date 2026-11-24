@@ -75,9 +75,11 @@ def cmd_build(
 @app.command("flash")
 def cmd_flash(
     target: flash.Target = typer.Argument(
-        flash.Target.RECOVERY,
-        help="'recovery': lk2nd + toolbox only. 'all': also the signing key and vbmeta "
-             "(first install, or after changing keys)."),
+        flash.Target.TOOLBOX,
+        help="'toolbox': lk2nd + toolbox only. 'all': also the signing key and vbmeta "
+             "(first install, or after changing keys). 'linux-first': power-on starts "
+             "Linux, volume-up KaiOS (needs a backup). 'kaios-first': back to power-on "
+             "KaiOS, volume-up Linux."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
 ) -> None:
     """Flash the phone (must be in stock fastboot: hold volume-down while plugging in)."""
