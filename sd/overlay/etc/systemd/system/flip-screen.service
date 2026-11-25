@@ -1,0 +1,10 @@
+[Unit]
+Description=Screen off when the lid is closed or the phone is idle
+After=flip-splash.service
+
+[Service]
+ExecStart=/usr/lib/flip/screen
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

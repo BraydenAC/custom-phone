@@ -59,6 +59,11 @@ def flashed_pkmd_record() -> Path:
     return config_dir() / "flashed-pkmd.sha256"
 
 
+def flashed_layout_record() -> Path:
+    """Which boot layout (profile.LAYOUTS) was last flashed to the phone."""
+    return config_dir() / "flashed-layout"
+
+
 def cross_compile() -> str:
     return os.environ.get("CROSS_COMPILE", "aarch64-linux-gnu-")
 

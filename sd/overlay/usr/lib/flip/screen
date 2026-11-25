@@ -1,0 +1,224 @@
+#!/usr/bin/python3
+"""Turn the screen off when the lid closes or nobody has pressed a key for a
+while, and back on when the lid opens or a key is pressed.
+
+"Off" = the display powered down (framebuffer blank: panel and backlight) and
+the keypad light off. Sleep (suspend) on closing is systemd-logind's job
+(/etc/systemd/logind.conf.d/flip.conf); this keeps the screen dark while the
+phone stays awake (on USB power) and handles the idle timeouts: screen off
+after idle_off, sleep after idle_sleep (on battery only, like the lid).
+
+Settings: /etc/flip/screen.conf ([screen] idle_off, idle_sleep = seconds,
+0 = never).
+"""
+
+import configparser
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import time
+
+CONFIG = "/etc/flip/screen.conf"
+DEFAULTS = {"idle_off": "600", "idle_sleep": "900"}
+INPUT = "/dev/input"
+FB_BLANK = "/sys/class/graphics/fb0/blank"
+KEYPAD_LIGHT = "/sys/class/backlight/ext-backlight/brightness"
+SPLASH_PID = "/run/flip-splash.pid"  # written by the startup animation
+POWER_SUPPLIES = "/sys/class/power_supply"
+USB_RETRY = 60  # on USB power: look again this often whether it's gone
+
+EV_KEY, EV_SW, SW_LID = 0x01, 0x05, 0x00
+EVENT = struct.Struct("llHHi")  # struct input_event (64-bit time)
+
+
+def eviocgsw(length):
+    """EVIOCGSW(len): read the switch states as a bitmask."""
+    return (2 << 30) | (length << 16) | (ord("E") << 8) | 0x1B
+
+
+def load_config(path=CONFIG):
+    cp = configparser.ConfigParser()
+    cp.read_dict({"screen": DEFAULTS})
+    cp.read(path)
+    cfg = {}
+    for key, default in DEFAULTS.items():
+        try:
+            cfg[key] = max(0.0, float(cp["screen"].get(key)))
+        except ValueError:
+            cfg[key] = float(default)
+    return cfg
+
+
+class Policy:
+    """When the screen should be on. Pure logic, so it can be tested."""
+
+    def __init__(self, idle_off, now, lid_closed=False, idle_sleep=0):
+        self.idle_off, self.last_input, self.lid_closed = idle_off, now, lid_closed
+        self.idle_sleep = idle_sleep
+        self.next_sleep = now  # no sleep before this (after one, or on USB power)
+
+    def key(self, now):
+        self.last_input = now
+
+    def lid(self, closed, now):
+        self.lid_closed = closed
+        if not closed:
+            self.last_input = now  # opening the lid counts as using the phone
+
+    def screen_on(self, now):
+        if self.lid_closed:
+            return False
+        return self.idle_off <= 0 or now - self.last_input < self.idle_off
+
+    def sleep_due(self, now):
+        """Time to sleep: the lid is open and nobody has used the phone.
+        (Closed, logind already decides.) Time asleep doesn't count: the
+        monotonic clock stops during suspend."""
+        return (not self.lid_closed and self.idle_sleep > 0
+                and now - self.last_input >= self.idle_sleep and now >= self.next_sleep)
+
+    def postpone_sleep(self, now, seconds):
+        self.next_sleep = now + seconds
+
+    def wait(self, now):
+        """Seconds until something can change by itself (None: only on input)."""
+        if self.lid_closed:
+            return None
+        idle = now - self.last_input
+        times = [t - idle for t in (self.idle_off, self.idle_sleep) if t > idle]
+        if self.idle_sleep > 0 and idle >= self.idle_sleep and self.next_sleep > now:
+            times.append(self.next_sleep - now)
+        return min(times) if times else None
+
+
+def splash_running(path=SPLASH_PID):
+    """The startup animation owns the screen until it exits."""
+    try:
+        with open(path) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return False
+    return os.path.exists(f"/proc/{pid}")
+
+
+def usb_power_online(root=POWER_SUPPLIES):
+    """True if a cable is delivering power (the charger input, not the USB link)."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(root, name, "type")) as f:
+                kind = f.read().strip()
+            with open(os.path.join(root, name, "online")) as f:
+                online = f.read().strip()
+        except OSError:
+            continue
+        if kind in ("USB", "Mains") and online == "1":
+            return True
+    return False
+
+
+def suspend():
+    try:
+        subprocess.run(["systemctl", "suspend"], timeout=30, check=True)
+    except (OSError, subprocess.SubprocessError) as e:
+        print(f"screen: suspend: {e}", file=sys.stderr, flush=True)
+
+
+def write(path, value):
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+    except OSError as e:
+        print(f"screen: {path}: {e}", file=sys.stderr, flush=True)
+
+
+def set_screen(on):
+    write(FB_BLANK, "0" if on else "4")  # 4 = FB_BLANK_POWERDOWN
+    write(KEYPAD_LIGHT, "1" if on else "0")
+
+
+def open_inputs():
+    """Every event device that has keys or switches."""
+    fds = {}
+    for name in sorted(os.listdir(INPUT)):
+        if not name.startswith("event"):
+            continue
+        caps = f"/sys/class/input/{name}/device/capabilities/ev"
+        try:
+            with open(caps) as f:
+                ev = int(f.read().strip(), 16)
+        except (OSError, ValueError):
+            continue
+        if ev & ((1 << EV_KEY) | (1 << EV_SW)):
+            try:
+                fds[os.open(os.path.join(INPUT, name), os.O_RDONLY | os.O_NONBLOCK)] = name
+            except OSError:
+                pass
+    return fds
+
+
+def lid_closed_now(fds):
+    for fd in fds:
+        buf = bytearray(8)
+        try:
+            fcntl.ioctl(fd, eviocgsw(len(buf)), buf)
+        except OSError:
+            continue
+        if buf[0] & (1 << SW_LID):
+            return True
+    return False
+
+
+def main():
+    signal.signal(signal.SIGTERM, lambda *_: (set_screen(True), sys.exit(0)))
+    cfg = load_config()
+    fds = open_inputs()
+    now = time.monotonic()
+    policy = Policy(cfg["idle_off"], now, lid_closed_now(fds), cfg["idle_sleep"])
+    on = None
+    while True:
+        now = time.monotonic()
+        want = policy.screen_on(now)
+        # Leave the screen alone while the startup animation owns it.
+        splash = splash_running()
+        if want != on and not splash:
+            set_screen(want)
+            on = want
+        if not splash and policy.sleep_due(now):
+            if usb_power_online():  # stay awake for charging and flip's USB link
+                policy.postpone_sleep(now, USB_RETRY)
+            else:
+                policy.postpone_sleep(now, policy.idle_sleep)  # awake time, after waking
+                suspend()
+            continue
+        wait = policy.wait(now)
+        if splash:
+            wait = 1.0 if wait is None else min(wait, 1.0)
+        ready, _, _ = select.select(list(fds), [], [], wait)
+        now = time.monotonic()
+        for fd in ready:
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            except OSError:  # device gone
+                os.close(fd)
+                del fds[fd]
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                _, _, kind, code, value = EVENT.unpack_from(data, off)
+                if kind == EV_KEY and value in (1, 2):
+                    policy.key(now)
+                elif kind == EV_SW and code == SW_LID:
+                    policy.lid(bool(value), now)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

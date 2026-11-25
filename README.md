@@ -32,8 +32,9 @@ Run commands as `uv run flip ...`, or install it on your PATH with
 | Command | What it does |
 |---|---|
 | `flip build` | Build the kernel, lk2nd, the toolbox and the signed images into `out/` |
-| `flip flash` | Flash `recovery` (lk2nd + toolbox) |
+| `flip flash` | Flash lk2nd + toolbox (wherever the layout keeps them) |
 | `flip flash all` | Also install your signing key and vbmeta (first install) |
+| `flip flash linux-first` | Power-on starts Linux, volume-up KaiOS (`kaios-first` undoes it) |
 | `flip backup create /dev/sdX` | Full eMMC backup via the toolbox (read-only mode) |
 | `flip backup list` / `verify` | List backups / re-check their SHA-256 hashes |
 | `flip backup adopt-vbmeta` | Build from your own phone's stock vbmeta |
@@ -60,24 +61,49 @@ Run commands as `uv run flip ...`, or install it on your PATH with
    keep a second copy elsewhere: `modemst1/2`, `fsg` and `persist` hold the
    IMEI and radio calibration and can't be recreated.
 5. `flip backup adopt-vbmeta` so future builds use your own stock vbmeta.
+6. Optional, to start Linux by default: `flip build` again (it now makes the
+   KaiOS image for recovery from your backup), then `flip flash linux-first`
+   from stock fastboot. `flip flash kaios-first` undoes it.
+
+`flip flash` alone (target `toolbox`) updates lk2nd + the toolbox wherever
+the current layout keeps them; flip remembers the last layout it flashed in
+`~/.config/flip/flashed-layout`.
 
 `flip flash` refuses to run unless the phone is in **stock** fastboot. In
-lk2nd's fastboot, "recovery" means only the part after lk2nd, so flashing
-there would put the image in the wrong place.
+lk2nd's fastboot, lk2nd's own partition means only the part after lk2nd, so
+flashing there would put the image in the wrong place.
 
 ## Booting
 
-- **Toolbox:** hold volume-up while powering on and release it when the
-  "custom operating system" warning appears.
-- **Linux from SD card:** same keys. lk2nd first looks for an ext2 file
-  system with `extlinux/extlinux.conf` on any partition of 16 MiB or more,
-  including an SD card, and boots it if found, otherwise the toolbox. lk2nd
-  only reads MBR partition tables, not GPT (`flip sd build` uses MBR). If a
-  card doesn't boot, `fastboot oem boot-scan` in lk2nd's fastboot (volume-down
-  as lk2nd starts) reports what it found on each partition.
-- **Rescue:** hold volume-up again as soon as the warning disappears to skip
-  that search and always get the toolbox.
-- **KaiOS:** power on without holding any keys.
+The phone's own bootloader can't be changed: it starts the **boot** partition
+normally, and the **recovery** partition when volume-up is held at power-on.
+flip puts lk2nd (+ the toolbox) in one and KaiOS in the other:
+
+| | power on | hold volume-up at power-on |
+|---|---|---|
+| `linux-first` | lk2nd | KaiOS |
+| `kaios-first` (first install) | KaiOS | lk2nd |
+
+Holding volume-up: release it when the "custom operating system" warning
+appears.
+
+- **lk2nd** looks for an ext2 file system with `extlinux/extlinux.conf` on
+  any partition of 16 MiB or more, including an SD card, and boots it if
+  found, otherwise the toolbox. lk2nd only reads MBR partition tables, not GPT
+  (`flip sd build` uses MBR). If a card doesn't boot, `fastboot oem boot-scan`
+  in lk2nd's fastboot (volume-down as lk2nd starts) reports what it found on
+  each partition.
+- **Toolbox (rescue):** press volume-up as lk2nd starts (just after the
+  warning disappears) to skip that search. In `kaios-first` that means: hold
+  volume-up at power-on, release at the warning, press it again.
+- **From the toolbox:** "6. Start SD Linux", "7. Start KaiOS".
+- **From Linux:** `flip` restarts the phone into lk2nd itself (a plain restart
+  in `linux-first`, `reboot recovery` in `kaios-first`).
+- Plugging in USB while the phone is off starts the boot partition (in
+  `linux-first`: Linux).
+- There is no stock recovery any more (the toolbox replaced it). In
+  `linux-first`, don't use KaiOS's factory reset: it restarts into "recovery",
+  which is now KaiOS itself. Go back to `kaios-first` first.
 
 ## Linux on the SD card
 
@@ -163,6 +189,22 @@ for first bring-up only. Anyone with a cable gets root on a debug card.
 
 Kernel changes live in `patches/linux/` and are re-applied to the pinned source
 on every build.
+
+### Startup animation
+
+While Debian starts, the screen shows black hexagons spreading over orange,
+following real startup steps (storage, USB link, Wi-Fi, audio, modem), then
+"READY"; after that the screen goes back to the text console. Settings are in
+`/etc/flip/splash.conf` on the card: `style = bloom` (from the centre, the
+default) or `style = rise` (from the bottom up), plus hexagon size, step
+names, frame rate and how long "READY" stays. Preview a setting without
+restarting: `flip phone run -- /usr/lib/flip/splash --demo 14`.
+
+At shutdown the hexagons go dark one by one (random order), then "RESTARTING"
+or "OFF". Powering off with a USB cable delivering power shows "UNPLUG USB"
+first and waits up to 8 s (`unplug_wait`) for it to come out: powering off
+while plugged in has crashed this phone. Preview:
+`flip phone run -- /usr/lib/flip/splash --shutdown poweroff --demo 3`.
 
 ## Pinned inputs
 

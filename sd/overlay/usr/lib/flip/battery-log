@@ -1,0 +1,43 @@
+#!/bin/bash
+# Battery logger: one line a minute to /var/log/flip/battery.csv, read by
+# `flip battery` on a trusted computer.
+#
+# Columns: time (unix s), uptime (s, includes sleep), status, usb (charger
+# input online), vbat (mV, now), ocv (mV, the BMS's resting-voltage estimate),
+# capacity (%, from ocv), screen (1 on, 0 off), suspends (successful so far).
+# "#boot <time>" starts each boot and "#note <time> <text>" marks a note
+# (`flip battery note`).
+#
+# No samples while the phone sleeps ("sleep 60" counts awake time only), so a
+# gap longer than a minute is time spent asleep.
+
+LOG=/var/log/flip/battery.csv
+BAT=/sys/class/power_supply/pm8916-bms-vm
+CHG=/sys/class/power_supply/pm8916-lbc-chgr
+KEEP=40000  # lines, about four weeks
+
+get() {  # get VAR FILE [DEFAULT]: read a sysfs value without forking
+    local v
+    read -r v 2>/dev/null < "$2" || v=${3:-}
+    printf -v "$1" '%s' "$v"
+}
+
+mkdir -p "${LOG%/*}"
+if [ -f "$LOG" ] && [ "$(wc -l < "$LOG")" -gt "$KEEP" ]; then
+    tail -n "$((KEEP / 2))" "$LOG" > "$LOG.new" && mv "$LOG.new" "$LOG"
+fi
+[ -s "$LOG" ] || echo "time,uptime,status,usb,vbat,ocv,capacity,screen,suspends" >> "$LOG"
+echo "#boot $EPOCHSECONDS" >> "$LOG"
+
+while :; do
+    get status "$BAT/status" ?
+    get usb "$CHG/online" 0
+    get vbat "$BAT/voltage_now" 0
+    get ocv "$BAT/voltage_ocv" 0
+    get cap "$BAT/capacity" ""
+    get blank /sys/class/backlight/backlight/bl_power 0
+    get susp /sys/power/suspend_stats/success 0
+    read -r up _ < /proc/uptime
+    echo "$EPOCHSECONDS,${up%.*},$status,$usb,$((vbat / 1000)),$((ocv / 1000)),$cap,$((blank == 0)),$susp" >> "$LOG"
+    sleep 60
+done

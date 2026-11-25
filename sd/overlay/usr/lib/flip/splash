@@ -1,0 +1,613 @@
+#!/usr/bin/python3
+"""Startup and shutdown animations on the phone's screen (hexagons, orange/black).
+
+Startup: black hexagons spread over orange, following real startup steps
+(systemd units, STEPS below); when the system has finished starting, a ripple
+runs through them, "READY" shows, and the screen goes back to the text console.
+
+Shutdown (--shutdown poweroff|reboot, flip-splash-shutdown@.service): orange
+hexagons go dark one by one in a random, spread-out order. The last ones wait
+until every service has stopped. Then "RESTARTING", or for a power-off "OFF" --
+after "UNPLUG USB" if a cable is delivering power (powering off while plugged
+in crashes this phone), for at most `unplug_wait` seconds.
+
+Settings: /etc/flip/splash.conf (see STYLES / DEFAULTS).
+Try them any time:  /usr/lib/flip/splash --demo 14
+                    /usr/lib/flip/splash --shutdown poweroff --demo 3
+"""
+
+import array
+import configparser
+import fcntl
+import math
+import mmap
+import os
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+CONFIG = "/etc/flip/splash.conf"
+FB = "/dev/fb0"
+FB_SYS = "/sys/class/graphics/fb0"
+TTY = "/dev/tty1"
+SPLASH_PID = "/run/flip-splash.pid"  # the screen manager leaves the screen alone meanwhile
+KDSETMODE, KDGETMODE, KD_TEXT, KD_GRAPHICS = 0x4B3A, 0x4B3B, 0x00, 0x01
+FBIOGET_VSCREENINFO, FBIOPUT_VSCREENINFO, FBIOBLANK = 0x4600, 0x4601, 0x4611
+FB_VAR_SIZE, FB_VAR_ACTIVATE, FB_ACTIVATE_FORCE, FB_BLANK_UNBLANK = 160, 84, 0x80, 0
+
+# bloom: hexagons grow from the centre to the edges. rise: they fill the
+# screen from the bottom up.
+STYLES = ("bloom", "rise")
+DEFAULTS = {"style": "bloom", "hex_size": "15", "step_names": "yes", "hold": "2",
+            "fps": "15", "shutdown_length": "3", "unplug_wait": "8"}
+SHUTDOWN_KINDS = ("poweroff", "reboot")
+SHUTDOWN_GAP = 0.2  # seconds of black between the last hexagon and the message
+POWER_SUPPLIES = "/sys/class/power_supply"
+
+# (label, unit that is active once the step is done). Order = display order.
+STEPS = [
+    ("STORAGE", "local-fs.target"),
+    ("USB LINK", "flipd.service"),
+    ("WI-FI", "NetworkManager.service"),
+    ("AUDIO", "sound.target"),
+    ("MODEM", "ModemManager.service"),
+]
+
+ORANGE, ORANGE_DARK, ORANGE_LIGHT, BLACK = 0xFF7300, 0xE25F00, 0xFF9A40, 0x000000
+
+# 5x7 capitals, one string per row ("#" = pixel).
+FONT = {
+    "A": ".###.|#...#|#...#|#####|#...#|#...#|#...#",
+    "B": "####.|#...#|#...#|####.|#...#|#...#|####.",
+    "C": ".###.|#...#|#....|#....|#....|#...#|.###.",
+    "D": "####.|#...#|#...#|#...#|#...#|#...#|####.",
+    "E": "#####|#....|#....|####.|#....|#....|#####",
+    "F": "#####|#....|#....|####.|#....|#....|#....",
+    "G": ".###.|#...#|#....|#.###|#...#|#...#|.####",
+    "H": "#...#|#...#|#...#|#####|#...#|#...#|#...#",
+    "I": ".###.|..#..|..#..|..#..|..#..|..#..|.###.",
+    "J": "..###|...#.|...#.|...#.|...#.|#..#.|.##..",
+    "K": "#...#|#..#.|#.#..|##...|#.#..|#..#.|#...#",
+    "L": "#....|#....|#....|#....|#....|#....|#####",
+    "M": "#...#|##.##|#.#.#|#.#.#|#...#|#...#|#...#",
+    "N": "#...#|#...#|##..#|#.#.#|#..##|#...#|#...#",
+    "O": ".###.|#...#|#...#|#...#|#...#|#...#|.###.",
+    "P": "####.|#...#|#...#|####.|#....|#....|#....",
+    "Q": ".###.|#...#|#...#|#...#|#.#.#|#..#.|.##.#",
+    "R": "####.|#...#|#...#|####.|#.#..|#..#.|#...#",
+    "S": ".####|#....|#....|.###.|....#|....#|####.",
+    "T": "#####|..#..|..#..|..#..|..#..|..#..|..#..",
+    "U": "#...#|#...#|#...#|#...#|#...#|#...#|.###.",
+    "V": "#...#|#...#|#...#|#...#|#...#|.#.#.|..#..",
+    "W": "#...#|#...#|#...#|#.#.#|#.#.#|#.#.#|.#.#.",
+    "X": "#...#|#...#|.#.#.|..#..|.#.#.|#...#|#...#",
+    "Y": "#...#|#...#|.#.#.|..#..|..#..|..#..|..#..",
+    "Z": "#####|....#|...#.|..#..|.#...|#....|#####",
+    "-": ".....|.....|.....|#####|.....|.....|.....",
+    ".": ".....|.....|.....|.....|.....|.##..|.##..",
+    " ": ".....|.....|.....|.....|.....|.....|.....",
+}
+
+
+def load_config(path=CONFIG):
+    cp = configparser.ConfigParser()
+    cp.read_dict({"splash": DEFAULTS})
+    cp.read(path)  # a missing file is fine
+    s = cp["splash"]
+
+    def number(key, lo, hi, kind=int):
+        try:
+            return min(hi, max(lo, kind(s.get(key))))
+        except ValueError:
+            return kind(DEFAULTS[key])
+
+    style = s.get("style").strip().lower()
+    return {
+        "style": style if style in STYLES else DEFAULTS["style"],
+        "hex_size": number("hex_size", 8, 30),
+        "step_names": s.getboolean("step_names", fallback=True),
+        "hold": number("hold", 0, 30, float),
+        "fps": number("fps", 2, 30),
+        "shutdown_length": number("shutdown_length", 0.5, 20, float),
+        "unplug_wait": number("unplug_wait", 0, 60, float),
+    }
+
+
+class Screen:
+    """A 32-bit XRGB framebuffer (or any bytearray of the same layout)."""
+
+    def __init__(self, buf, width, height, stride):
+        self.buf, self.w, self.h, self.stride = buf, width, height, stride
+        self._rows = {}
+
+    def _row(self, color, n):
+        key = (color, n)
+        if key not in self._rows:
+            self._rows[key] = color.to_bytes(4, "little") * n
+        return self._rows[key]
+
+    def span(self, y, x0, x1, color):
+        """Pixels x0 <= x < x1 on row y (clipped)."""
+        x0, x1 = max(0, x0), min(self.w, x1)
+        if 0 <= y < self.h and x0 < x1:
+            o = y * self.stride + x0 * 4
+            self.buf[o:o + (x1 - x0) * 4] = self._row(color, x1 - x0)
+
+    def rect(self, x, y, w, h, color):
+        for yy in range(y, y + h):
+            self.span(yy, x, x + w, color)
+
+    def fill(self, color):
+        self.rect(0, 0, self.w, self.h, color)
+
+    def text(self, s, cx, cy, scale, color):
+        """Centred on (cx, cy)."""
+        s = s.upper()
+        width = len(s) * 6 * scale - scale
+        x = cx - width // 2
+        y = cy - 7 * scale // 2
+        for ch in s:
+            rows = FONT.get(ch, FONT[" "]).split("|")
+            for ry, row in enumerate(rows):
+                for rx, px in enumerate(row):
+                    if px == "#":
+                        self.rect(x + rx * scale, y + ry * scale, scale, scale, color)
+            x += 6 * scale
+
+    def text_width(self, s, scale):
+        return len(s) * 6 * scale - scale
+
+
+def hex_spans(cx, cy, r):
+    """Rows of a pointy-top hexagon: [(y, x0, x1)]."""
+    half_w = r * math.sqrt(3) / 2
+    spans = []
+    for y in range(math.floor(cy - r), math.ceil(cy + r) + 1):
+        dy = abs(y + 0.5 - cy)
+        if dy > r:
+            continue
+        hw = half_w if dy <= r / 2 else half_w * (r - dy) / (r / 2)
+        x0, x1 = round(cx - hw), round(cx + hw)
+        if x1 > x0:
+            spans.append((y, x0, x1))
+    return spans
+
+
+def layout(style, size, width, height):
+    """Hexagon cells covering the screen, in the order they light up."""
+    w = math.sqrt(3) * size
+    cells = []
+    row = 0
+    y = -size
+    while y < height + size:
+        x = -w + (w / 2 if row % 2 else 0)
+        while x < width + w:
+            jitter = ((round(x) * 7 + round(y) * 13) % 5) * 0.22
+            if style == "rise":
+                d = (height - y) / (1.5 * size) + jitter * 1.6
+            else:
+                d = math.hypot(x - width / 2, y - height * 0.47) / w + jitter
+            spans = [s for s in hex_spans(x, y, size - 1.2) if 0 <= s[0] < height]
+            if spans:
+                cells.append({"d": d, "spans": spans, "color": None})
+            x += w
+        y += 1.5 * size
+        row += 1
+    cells.sort(key=lambda c: c["d"])
+    return cells
+
+
+class Progress:
+    """Startup progress from systemd, polled in the background."""
+
+    def __init__(self, demo=None):
+        self.demo, self.start = demo, time.monotonic()
+        self.done_steps, self.finished = 0, False
+        self.step_since = self.start
+        self.shown = 0.0
+        if demo is None:
+            threading.Thread(target=self._poll, daemon=True).start()
+
+    def _poll(self):
+        units = [u for _, u in STEPS]
+        while not self.finished:
+            try:
+                out = subprocess.run(
+                    ["systemctl", "show", "-p", "ActiveState", "--value", *units],
+                    capture_output=True, text=True, timeout=5).stdout.split()
+                done = 0
+                for state in out:  # in order: count leading finished steps
+                    if state != "active":
+                        break
+                    done += 1
+                if done != self.done_steps:
+                    self.done_steps, self.step_since = done, time.monotonic()
+                state = subprocess.run(["systemctl", "is-system-running"],
+                                       capture_output=True, text=True,
+                                       timeout=5).stdout.strip()
+                if state not in ("initializing", "starting", ""):
+                    self.finished = True
+            except (OSError, subprocess.SubprocessError):
+                pass
+            time.sleep(1)  # each check asks systemd (busy starting things)
+
+    def update(self):
+        """Fraction to show (eased, keeps creeping while a step takes long)."""
+        now = time.monotonic()
+        n = len(STEPS) + 1
+        if self.demo is not None:
+            frac = min(1.0, (now - self.start) / self.demo)
+            self.done_steps = min(len(STEPS), int(frac * n))
+            self.finished = frac >= 1.0
+        if self.finished:
+            goal = 1.0
+        else:
+            creep = 0.85 * (1 - math.exp(-(now - self.step_since) / 4))
+            goal = (self.done_steps + creep) / n
+        self.shown += (max(goal, self.shown) - self.shown) * 0.2
+        return 1.0 if self.finished and self.shown > 0.995 else self.shown
+
+    def label(self):
+        return STEPS[min(self.done_steps, len(STEPS) - 1)][0] + "..."
+
+
+def paint_cells(screen, cells, colors):
+    """Repaint only the cells whose colour changed."""
+    for cell, color in zip(cells, colors):
+        if cell["color"] != color:
+            cell["color"] = color
+            for y, x0, x1 in cell["spans"]:
+                screen.span(y, x0, x1, color)
+
+
+def frame_colors(cells, p, frame, finish):
+    """Each cell's colour at progress p; finish = seconds since done, or None."""
+    k = int(p * len(cells))
+    colors = []
+    for i, c in enumerate(cells):
+        if i < k:
+            shimmer = finish is None and math.sin(frame * 0.12 + c["d"] * 0.9) > 0.78
+            color = ORANGE_DARK if shimmer else BLACK
+        elif i < k + 10:
+            color = ORANGE_DARK
+        else:
+            color = ORANGE
+        if finish is not None and 0 < finish * 11 - c["d"] < 1.3:
+            color = ORANGE_LIGHT
+        colors.append(color)
+    return colors
+
+
+LABEL_SCALE = 2
+
+
+def label_box(screen, labels=None):
+    """One box wide enough for every label, so a shorter one leaves nothing behind."""
+    labels = labels or [name + "..." for name, _ in STEPS]
+    w = max(screen.text_width(text, LABEL_SCALE) for text in labels) + 20
+    return screen.w // 2 - w // 2, screen.h - 52, w, 26
+
+
+def draw_label(screen, text, labels=None):
+    x, y, w, h = label_box(screen, labels)
+    screen.rect(x, y, w, h, BLACK)
+    screen.text(text, screen.w // 2, y + h // 2, LABEL_SCALE, ORANGE)
+
+
+def draw_ready(screen):
+    """Solid black behind it: orange text over the orange hexagon gaps is unreadable."""
+    scale = 5
+    w, h = screen.text_width("READY", scale) + 24, 7 * scale + 24
+    screen.rect(screen.w // 2 - w // 2, screen.h // 2 - h // 2, w, h, BLACK)
+    screen.text("READY", screen.w // 2, screen.h // 2, scale, ORANGE)
+
+
+def run(screen, cfg, progress, sleep=time.sleep, clock=time.monotonic,
+        keep_screen=lambda: False):
+    """Animate until startup is done (plus the finish and `hold` seconds).
+
+    keep_screen() takes the screen back if something gave it to the text
+    console, and returns True when it did (everything is then redrawn)."""
+    cells = layout(cfg["style"], cfg["hex_size"], screen.w, screen.h)
+    screen.fill(ORANGE)
+    frame, finished_at = 0, None
+    period = 1 / cfg["fps"]
+    while True:
+        t = clock()
+        if keep_screen():
+            screen.fill(ORANGE)
+            for cell in cells:
+                cell["color"] = None
+        p = progress.update()
+        if p >= 1.0 and finished_at is None:
+            finished_at = t
+            # The label goes away: clear its box (cells don't cover the gaps
+            # between them), then repaint every cell once.
+            x, y, w, h = label_box(screen)
+            screen.rect(x, y, w, h, ORANGE)
+            for cell in cells:
+                cell["color"] = None
+        finish = None if finished_at is None else t - finished_at
+        paint_cells(screen, cells, frame_colors(cells, p, frame, finish))
+        if finish is None:
+            if cfg["step_names"]:
+                draw_label(screen, progress.label())
+        elif finish > 0.6:
+            draw_ready(screen)
+        if finish is not None and finish > 1.0 + cfg["hold"]:
+            return frame + 1
+        frame += 1
+        sleep(max(0.0, period - (clock() - t)))
+
+
+# --- shutdown -------------------------------------------------------------------
+
+SHUTDOWN_LABELS = ["STOPPING APPS...", "POWERING OFF...", "RESTARTING..."]
+
+
+def spread_order(cells, rng):
+    """Random order, but each pick avoids the last few: no clumps or stripes."""
+    left, out, recent = list(cells), [], []
+    while left:
+        best, best_i = -1.0, 0
+        for _ in range(8):
+            i = rng.randrange(len(left))
+            c = left[i]
+            d = min((math.hypot(c["x"] - r["x"], c["y"] - r["y"]) for r in recent),
+                    default=1e9)
+            if d > best:
+                best, best_i = d, i
+        cell = left.pop(best_i)
+        out.append(cell)
+        recent = (recent + [cell])[-6:]
+    return out
+
+
+def usb_power_online(root=POWER_SUPPLIES):
+    """True if a cable is delivering power (the charger input, not the USB link)."""
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return False
+    for name in names:
+        try:
+            with open(os.path.join(root, name, "type")) as f:
+                kind = f.read().strip()
+            with open(os.path.join(root, name, "online")) as f:
+                online = f.read().strip()
+        except OSError:
+            continue
+        if kind in ("USB", "Mains") and online == "1":
+            return True
+    return False
+
+
+def services_stopped():
+    """systemd has handed over to systemd-shutdown: every service has stopped."""
+    try:
+        with open("/proc/1/comm") as f:
+            return f.read().strip() == "systemd-shutdow"  # comm is cut at 15
+    except OSError:
+        return False
+
+
+def draw_plug(screen, color):
+    """A USB plug, pins at the top."""
+    cx = screen.w // 2
+    screen.rect(cx - 22, 64, 44, 30, color)
+    screen.rect(cx - 16, 70, 32, 18, BLACK)
+    screen.rect(cx - 12, 74, 8, 8, color)
+    screen.rect(cx + 4, 74, 8, 8, color)
+    screen.rect(cx - 12, 94, 24, 36, color)
+    screen.rect(cx - 4, 130, 8, 18, color)
+
+
+def run_shutdown(screen, cfg, kind, rng, sleep=time.sleep, clock=time.monotonic,
+                 keep_screen=lambda: False, stopped=services_stopped,
+                 usb=usb_power_online):
+    """Hexagons go dark, then the message. Returns what it ended on."""
+    size = cfg["hex_size"]
+    cells = []
+    for cell in layout("bloom", size, screen.w, screen.h):
+        ys = [y for y, _, _ in cell["spans"]]
+        xs = [x for _, x0, x1 in cell["spans"] for x in (x0, x1)]
+        cell.update(x=(min(xs) + max(xs)) / 2, y=(min(ys) + max(ys)) / 2)
+        cells.append(cell)
+    cells = spread_order(cells, rng)
+    final = "POWERING OFF..." if kind == "poweroff" else "RESTARTING..."
+    period = 1 / cfg["fps"]
+    start = clock()
+    shown = 0.0
+    screen.fill(BLACK)
+    while True:  # hexagons go dark
+        t = clock() - start
+        if keep_screen():
+            screen.fill(BLACK)
+            for cell in cells:
+                cell["color"] = None
+        done = stopped()
+        goal = min(1.0, t / cfg["shutdown_length"])
+        if not done:
+            goal = min(goal, 0.9)  # the last ones wait for the services
+        shown += (goal - shown) * (0.5 if done else 0.25)
+        if done and goal >= 1.0 and shown > 0.98:
+            shown = 1.0
+        k = int(shown * len(cells))
+        colors = [BLACK if i < k else ORANGE_DARK if i < k + 4 else ORANGE
+                  for i in range(len(cells))]
+        paint_cells(screen, cells, colors)
+        if shown < 1.0 and cfg["step_names"]:
+            draw_label(screen, final if done else "STOPPING APPS...", SHUTDOWN_LABELS)
+        if shown >= 1.0:
+            break
+        if t > 30:  # never hold up a shutdown for long
+            break
+        sleep(max(0.0, period - (clock() - start - t)))
+    screen.fill(BLACK)
+    sleep(SHUTDOWN_GAP)
+    ending = "RESTARTING" if kind == "reboot" else "OFF"
+    if kind == "poweroff" and usb():
+        ending = "UNPLUG USB"
+        waited = clock()
+        frame = 0
+        while usb() and clock() - waited < cfg["unplug_wait"]:
+            keep_screen()
+            draw_plug(screen, ORANGE if frame % 10 < 6 else ORANGE_DARK)
+            screen.text("UNPLUG USB", screen.w // 2, 180, 3, ORANGE)
+            frame += 1
+            sleep(period)
+        screen.fill(BLACK)
+        ending = "OFF" if not usb() else "OFF (STILL PLUGGED IN)"
+    keep_screen()
+    if kind == "reboot":
+        screen.text("RESTARTING", screen.w // 2, screen.h // 2, 3, ORANGE)
+    else:
+        screen.text("OFF", screen.w // 2, screen.h // 2, 6, ORANGE)
+    return ending
+
+
+def fb_geometry():
+    def read(name):
+        with open(os.path.join(FB_SYS, name)) as f:
+            return f.read().strip()
+
+    w, h = (int(v) for v in read("virtual_size").split(","))
+    bpp, stride = int(read("bits_per_pixel")), int(read("stride"))
+    if bpp != 32:
+        raise SystemExit(f"splash: unsupported {bpp}-bit framebuffer")
+    return w, h, stride
+
+
+def switch_on(fd):
+    """Turn the display output on. The text console normally does this when it
+    takes over the screen; with tty1 in graphics mode from the start it never
+    does, and the panel keeps showing the bootloader's last image. Setting the
+    (unchanged) mode with FB_ACTIVATE_FORCE makes the driver set up the display."""
+    var = bytearray(FB_VAR_SIZE)
+    fcntl.ioctl(fd, FBIOGET_VSCREENINFO, var)
+    activate = int.from_bytes(var[FB_VAR_ACTIVATE:FB_VAR_ACTIVATE + 4], "little")
+    var[FB_VAR_ACTIVATE:FB_VAR_ACTIVATE + 4] = (activate | FB_ACTIVATE_FORCE).to_bytes(4, "little")
+    fcntl.ioctl(fd, FBIOPUT_VSCREENINFO, var)
+    try:
+        fcntl.ioctl(fd, FBIOBLANK, FB_BLANK_UNBLANK)
+    except OSError:
+        pass
+
+
+def notify_ready():
+    """Tell systemd (Type=notify) that the console is off the screen."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+        sock.connect(addr)
+        sock.send(b"READY=1")
+
+
+def main(argv):
+    demo = float(argv[argv.index("--demo") + 1]) if "--demo" in argv else None
+    shutdown = argv[argv.index("--shutdown") + 1] if "--shutdown" in argv else None
+    if shutdown is not None and shutdown not in SHUTDOWN_KINDS:
+        raise SystemExit(f"splash: --shutdown {shutdown}? ({' or '.join(SHUTDOWN_KINDS)})")
+    cfg = load_config()
+    # Graphics mode before the screen even starts (flip-panel.service waits for
+    # READY=1): otherwise the console shows its text until this program is up.
+    tty = os.open(TTY, os.O_RDWR | os.O_NOCTTY)
+    fcntl.ioctl(tty, KDSETMODE, KD_GRAPHICS)
+    notify_ready()
+
+    def give_back():
+        """Text mode again; the console redraws itself. getty hangs up tty1
+        while it starts (our old handle then fails with EIO), so reopen it."""
+        try:
+            fd = os.open(TTY, os.O_RDWR | os.O_NOCTTY)
+            fcntl.ioctl(fd, KDSETMODE, KD_TEXT)
+            os.close(fd)
+        except OSError as e:
+            print(f"splash: couldn't give the screen back to the console: {e}",
+                  file=sys.stderr)
+
+    def stop(*_):  # shutdown while still starting
+        give_back()
+        os._exit(0)
+
+    # At shutdown, keep going whatever gets signalled: the screen is ours to the end.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN if shutdown and demo is None else stop)
+    for _ in range(200):  # the screen starts now (flip-panel.service)
+        if os.path.exists(FB):
+            break
+        time.sleep(0.05)
+    else:
+        give_back()
+        return 0
+    w, h, stride = fb_geometry()
+    fd = os.open(FB, os.O_RDWR)
+    fb = mmap.mmap(fd, stride * h)
+    try:
+        switch_on(fd)
+    except OSError as e:
+        print(f"splash: couldn't switch the display on: {e}", file=sys.stderr, flush=True)
+
+    def keep_screen():
+        """Graphics mode again if something (e.g. a tty reset) switched to text."""
+        nonlocal tty
+        mode = array.array("i", [KD_GRAPHICS])
+        try:
+            try:
+                fcntl.ioctl(tty, KDGETMODE, mode)
+            except OSError:  # hung up (getty starting): use a fresh handle
+                os.close(tty)
+                tty = os.open(TTY, os.O_RDWR | os.O_NOCTTY)
+                fcntl.ioctl(tty, KDGETMODE, mode)
+            if mode[0] == KD_GRAPHICS:
+                return False
+            fcntl.ioctl(tty, KDSETMODE, KD_GRAPHICS)
+            print("splash: the text console took the screen; took it back", flush=True)
+            return True
+        except OSError:  # never let this stop the animation
+            return False
+
+    if shutdown:
+        import random
+        begin = time.monotonic()
+        stopped = services_stopped if demo is None else (
+            lambda: time.monotonic() - begin > demo)
+        try:
+            ending = run_shutdown(Screen(fb, w, h, stride), cfg, shutdown,
+                                  random.Random(), keep_screen=keep_screen,
+                                  stopped=stopped)
+            print(f"splash: {shutdown}: {ending}", flush=True)
+        finally:
+            if demo is not None:  # a real shutdown leaves the last frame up
+                time.sleep(1.5)
+                give_back()
+        return 0
+
+    start = time.monotonic()
+    try:  # flip's screen manager (/usr/lib/flip/screen) waits while this runs
+        with open(SPLASH_PID, "w") as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError:
+        pass
+    try:
+        frames = run(Screen(fb, w, h, stride), cfg, Progress(demo),
+                     keep_screen=keep_screen)
+    finally:
+        give_back()
+        try:
+            os.unlink(SPLASH_PID)
+        except OSError:
+            pass
+    if demo is not None:
+        took = time.monotonic() - start
+        print(f"{cfg['style']}: {frames} frames in {took:.1f} s ({frames / took:.1f} fps)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

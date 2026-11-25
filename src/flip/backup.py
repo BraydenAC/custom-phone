@@ -161,3 +161,12 @@ def adopt_vbmeta(backup: Path) -> Path:
     dest = config.own_vbmeta()
     write_private(dest, src.read_bytes())
     return dest
+
+
+def system_partuuid(backup: Path) -> str:
+    """The phone's system partition UUID, from the backup's partition table."""
+    table = json.loads((backup / "gpt.json").read_text())["partitiontable"]
+    for part in table["partitions"]:
+        if part.get("name") == "system":
+            return part["uuid"]
+    raise FlipError(f"no 'system' partition in {backup / 'gpt.json'}")

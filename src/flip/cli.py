@@ -11,7 +11,7 @@ from typing import Optional
 
 import typer
 
-from flip import __version__, backup, build, config, device, flash, keys, lock, phone, sd
+from flip import __version__, backup, battery, build, config, device, flash, keys, lock, phone, sd
 from flip.util import FlipError, say
 
 app = typer.Typer(
@@ -34,6 +34,8 @@ trust_app = typer.Typer(help="Which computers the phone accepts.", no_args_is_he
 app.add_typer(sd_app, name="sd")
 app.add_typer(phone_app, name="phone")
 phone_app.add_typer(trust_app, name="trust")
+battery_app = typer.Typer(help="Battery drain, from the log the phone keeps (one line a minute).")
+app.add_typer(battery_app, name="battery")
 
 
 def _version(value: bool) -> None:
@@ -75,9 +77,11 @@ def cmd_build(
 @app.command("flash")
 def cmd_flash(
     target: flash.Target = typer.Argument(
-        flash.Target.RECOVERY,
-        help="'recovery': lk2nd + toolbox only. 'all': also the signing key and vbmeta "
-             "(first install, or after changing keys)."),
+        flash.Target.TOOLBOX,
+        help="'toolbox': lk2nd + toolbox only. 'all': also the signing key and vbmeta "
+             "(first install, or after changing keys). 'linux-first': power-on starts "
+             "Linux, volume-up KaiOS (needs a backup). 'kaios-first': back to power-on "
+             "KaiOS, volume-up Linux."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
 ) -> None:
     """Flash the phone (must be in stock fastboot: hold volume-down while plugging in)."""
@@ -382,6 +386,46 @@ def cmd_trust_remove(fingerprint: str = typer.Argument(..., help="From `flip pho
     with phone.session(port) as s:
         r = s.call("trust-remove", fingerprint=fingerprint)
     say(f"removed {r['removed']}")
+
+
+# --- battery -----------------------------------------------------------------
+
+@battery_app.callback(invoke_without_command=True)
+def cmd_battery(ctx: typer.Context,
+                all_: bool = typer.Option(False, "--all", help="Every stretch on battery, "
+                                          "not just the last 5."),
+                save: Optional[Path] = typer.Option(None, "--save",
+                                                    help="Also keep the raw log here."),
+                port: Optional[str] = PORT) -> None:
+    """Drain per stretch on battery: charge used, time asleep, hours a full charge lasts."""
+    if ctx.invoked_subcommand is not None:
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        local = Path(tmp) / "battery.csv"
+        with phone.session(port) as s:
+            s.pull(battery.LOG, local)
+        text = local.read_text(errors="replace")
+        if save:
+            if save.is_dir():
+                save = save / "battery.csv"
+            shutil.copyfile(local, save)
+            say(f"saved {save}")
+    for line in battery.report(text, None if all_ else 5):
+        print(line)
+
+
+@battery_app.command("note")
+def cmd_battery_note(text: str = typer.Argument(..., help='e.g. "before cpufreq"'),
+                     port: Optional[str] = PORT) -> None:
+    """Mark the log (shown with the stretch on battery it falls in or before)."""
+    text = " ".join(text.split())
+    script = f'echo "#note $(date +%s) $1" >> {battery.LOG}'
+    with phone.session(port) as s:
+        code = s.run(["sh", "-c", script, "sh", text], None, sys.stdout.buffer,
+                     sys.stderr.buffer)
+    if code:
+        raise typer.Exit(code)
+    say(f"noted: {text}")
 
 
 def main() -> None:

@@ -1,0 +1,36 @@
+From: flip
+Subject: [PATCH] arm64: dts: qcom: weeknd: lid (hall sensor) switch
+
+The flip's hall sensor is on GPIO 44 (stock "hall_sensor" in the WND
+overlay: pull-up, wakeup). Report it as SW_LID through gpio-keys and let it
+wake the phone, so systemd-logind can act on opening and closing the lid.
+
+diff --git i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+--- i/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
++++ w/arch/arm64/boot/dts/qcom/qm215-nokia-weeknd.dts
+@@ -128,6 +128,16 @@
+ 			gpios = <&msmgpio 91 GPIO_ACTIVE_LOW>;
+ 			linux,code = <KEY_VOLUMEUP>;
+ 		};
++
++		/* Hall sensor: low while the lid's magnet is near (closed) */
++		switch-lid {
++			label = "Lid";
++			gpios = <&msmgpio 44 GPIO_ACTIVE_LOW>;
++			linux,input-type = <EV_SW>;
++			linux,code = <SW_LID>;
++			debounce-interval = <15>;
++			wakeup-source;
++		};
+ 	};
+ 
+ 	matrix_keypad: keypad {
+@@ -719,7 +729,7 @@
+ 	};
+ 
+ 	gpio_keys_default: gpio-keys-default-state {
+-		pins = "gpio91", "gpio28";
++		pins = "gpio91", "gpio28", "gpio44";
+ 		function = "gpio";
+ 		drive-strength = <2>;
+ 		bias-pull-up;

@@ -245,3 +245,33 @@ def test_works_over_a_raw_tty(tmp_path, host):
     p.join()
     os.close(master)
     os.close(phone_fd)
+
+
+def test_feeds_stdin_from_a_pipe_without_the_buffered_reader():
+    """Reading a pipe through sys.stdin.buffer from a daemon thread made Python
+    abort at exit now and then; the feeder reads the file descriptor instead."""
+    import os
+    from flip.link import client as c
+
+    sent = []
+
+    class Ch:
+        def send(self, kind, data):
+            sent.append(data)
+
+    r, w = os.pipe()
+    os.write(w, b"hello")
+    os.close(w)
+    session = c.Session.__new__(c.Session)
+    session.ch = Ch()
+
+    class NoBuffered:
+        def fileno(self):
+            return r
+
+        def read1(self, n):
+            raise AssertionError("used the buffered reader")
+
+    session._feed(NoBuffered())
+    os.close(r)
+    assert b"".join(sent) == b"hello" and sent[-1] == b""

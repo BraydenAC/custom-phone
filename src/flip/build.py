@@ -7,7 +7,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from flip import config, fetch, images, initramfs, keys, lock, profile
+from flip import backup, config, fetch, images, initramfs, keys, lock, profile
 from flip.fingerprint import Stamp, fingerprint
 from flip.util import FlipError, run, say, sha256_file, warn
 
@@ -22,16 +22,30 @@ class Outputs:
     modules: Path = config.OUT / "modules"  # lib/modules/<release>/ for the SD card
     kernel_release: Path = config.OUT / "kernel-release"
     initramfs: Path = config.OUT / "initramfs.cpio.gz"
-    boot: Path = config.OUT / "boot.img"
+    boot: Path = config.OUT / "boot.img"  # toolbox boot image (kaios-first layout)
     dtbo: Path = config.OUT / "dtbo.img"
     lk2nd_head: Path = config.OUT / "lk2nd-head.img"
-    recovery: Path = config.OUT / "recovery.img"  # lk2nd + toolbox
+    recovery: Path = config.OUT / "recovery.img"  # kaios-first: lk2nd + toolbox -> recovery
+    # linux-first layout (profile.LAYOUTS)
+    boot_lf: Path = config.OUT / "boot-linux-first.img"  # toolbox boot image
+    lk2nd_head_lf: Path = config.OUT / "lk2nd-head-linux-first.img"
+    linux_first_boot: Path = config.OUT / "linux-first-boot.img"  # lk2nd + toolbox -> boot
+    # KaiOS -> recovery, made from your backup's boot and dtbo (not shareable)
+    linux_first_recovery: Path = config.OUT / "linux-first-recovery.img"
     pkmd: Path = config.OUT / "pkmd.bin"
     vbmeta: Path = config.OUT / "vbmeta.img"
 
 
 OUT = Outputs()
-LK2ND_BUILD = config.LK2ND_DIR / f"build-{profile.LK2ND_TARGET}"
+
+
+def lk2nd_build_dir(layout: str) -> Path:
+    """lk2nd is built once per layout (its partition differs), each in its own dir.
+
+    lk also copies emmc_appsboot.mbn two levels above BOOTLOADER_OUT (the build
+    dir's parent): with lk2nd/out/<layout>/lk that is lk2nd/out, not this repo.
+    """
+    return config.LK2ND_DIR / "out" / layout / "lk" / f"build-{profile.LK2ND_TARGET}"
 
 
 def missing_tools() -> list[str]:
@@ -123,26 +137,27 @@ def lk2nd_patches() -> list[Path]:
     return sorted((config.PATCHES / "lk2nd").glob("*.patch"))
 
 
-def lk2nd_fingerprint(pins: lock.Lock) -> str:
+def lk2nd_fingerprint(pins: lock.Lock, layout: str) -> str:
     dts = sorted(p for p in config.LK2ND_DTS.iterdir() if p.is_file())
     return fingerprint(
         f"lk2nd-v1 {pins.git['lk2nd'].commit} {config.toolchain_prefix()} "
-        + " ".join(profile.LK2ND_MAKE_ARGS),
+        + " ".join(profile.LK2ND_MAKE_ARGS[layout]),
         lk2nd_patches() + dts,
     )
 
 
-def build_lk2nd(pins: lock.Lock, jobs: int) -> Path:
+def build_lk2nd(pins: lock.Lock, jobs: int, layout: str) -> Path:
     src = config.LK2ND_DIR
     fetch.fetch_git(pins.git["lk2nd"], src)
-    out = LK2ND_BUILD / "lk.bin-dtb"
-    stamp = Stamp("lk2nd")
-    fp = lk2nd_fingerprint(pins)
+    build_dir = lk2nd_build_dir(layout)
+    out = build_dir / "lk.bin-dtb"
+    stamp = Stamp(f"lk2nd-{layout}")
+    fp = lk2nd_fingerprint(pins, layout)
     if out.exists() and stamp.matches(fp):
-        say(f"OK       lk.bin-dtb (inputs unchanged)")
+        say(f"OK       lk.bin-dtb for {layout} (inputs unchanged)")
         return out
     if out.exists():
-        say("lk2nd inputs changed, rebuilding")
+        say(f"lk2nd ({layout}) inputs changed, rebuilding")
 
     # Start from the pristine pinned source, so the result depends only on the
     # pin and files in this repo. Local edits in lk2nd/ are discarded: put
@@ -158,9 +173,10 @@ def build_lk2nd(pins: lock.Lock, jobs: int) -> Path:
     dts_link.symlink_to(Path("../../../..") / config.LK2ND_DTS.name)
 
     # Clean build: compile-time options don't reliably trigger rebuilds in lk.
-    if LK2ND_BUILD.exists():
-        shutil.rmtree(LK2ND_BUILD)
-    run(["make", f"-j{jobs}", profile.LK2ND_TARGET, *profile.LK2ND_MAKE_ARGS], cwd=src,
+    if build_dir.exists():
+        shutil.rmtree(build_dir)
+    run(["make", f"-j{jobs}", profile.LK2ND_TARGET, f"BOOTLOADER_OUT={build_dir.parent}",
+         *profile.LK2ND_MAKE_ARGS[layout]], cwd=src,
         env={"TOOLCHAIN_PREFIX": config.toolchain_prefix()})
     stamp.record(fp)
     return out
@@ -193,7 +209,8 @@ def toolbox_entries(busybox: Path, reboot_mode: Path) -> list[initramfs.Entry]:
 def build_toolbox(pins: lock.Lock) -> None:
     busybox = fetch.fetch_file(pins.file["busybox"])
     OUT.initramfs.write_bytes(initramfs.build(toolbox_entries(busybox, build_reboot_mode())))
-    images.mkbootimg(OUT.boot, OUT.kernel, profile.BOOT_CMDLINE, ramdisk=OUT.initramfs)
+    for layout, out in (("kaios-first", OUT.boot), ("linux-first", OUT.boot_lf)):
+        images.mkbootimg(out, OUT.kernel, profile.boot_cmdline(layout), ramdisk=OUT.initramfs)
 
 
 def build_dtbo() -> None:
@@ -205,13 +222,37 @@ def build_dtbo() -> None:
     images.mkdtboimg(OUT.dtbo, dtbs)
 
 
-def build_recovery(lk_bin: Path) -> None:
-    images.mkbootimg(OUT.lk2nd_head, lk_bin, "lk2nd", header_version=1,
-                     recovery_dtbo=OUT.dtbo)
-    image = images.assemble_recovery(OUT.lk2nd_head.read_bytes(), OUT.boot.read_bytes())
-    OUT.recovery.write_bytes(image)
-    say(f"recovery image: lk2nd {OUT.lk2nd_head.stat().st_size}/{profile.LK2ND_SLOT} bytes, "
-        f"total {len(image)}/{profile.RECOVERY_SIZE} bytes")
+def build_lk2nd_image(lk_bin: Path, layout: str) -> None:
+    """lk2nd + toolbox, for recovery (kaios-first) or boot (linux-first)."""
+    head, toolbox, out, size, part = {
+        "kaios-first": (OUT.lk2nd_head, OUT.boot, OUT.recovery, profile.RECOVERY_SIZE,
+                        "recovery"),
+        "linux-first": (OUT.lk2nd_head_lf, OUT.boot_lf, OUT.linux_first_boot,
+                        profile.BOOT_SIZE, "boot"),
+    }[layout]
+    images.mkbootimg(head, lk_bin, "lk2nd", header_version=1, recovery_dtbo=OUT.dtbo)
+    image = images.assemble_lk2nd_toolbox(head.read_bytes(), toolbox.read_bytes(), size, part)
+    out.write_bytes(image)
+    say(f"{out.name} ({part}): lk2nd {head.stat().st_size}/{profile.LK2ND_SLOT} bytes, "
+        f"total {len(image)}/{size} bytes")
+
+
+def build_kaios_recovery() -> None:
+    """KaiOS for the recovery partition (linux-first), from the newest backup."""
+    backups = backup.list_backups()
+    if not backups:
+        say("no backup yet: skipping linux-first-recovery.img (only needed for "
+            "`flip flash linux-first`)")
+        return
+    src = backups[-1]
+    image = images.kaios_for_recovery(
+        (src / "parts/boot.img").read_bytes(), (src / "parts/dtbo.img").read_bytes(),
+        backup.system_partuuid(src))
+    if len(image) > profile.RECOVERY_SIZE:
+        raise FlipError("KaiOS image is larger than the recovery partition")
+    OUT.linux_first_recovery.write_bytes(image)
+    OUT.linux_first_recovery.chmod(0o600)
+    say(f"{OUT.linux_first_recovery.name}: KaiOS from backup {src.name}, {len(image)} bytes")
 
 
 # --- vbmeta ------------------------------------------------------------------
@@ -257,13 +298,16 @@ def build_all(jobs: int, stock_override: Path | None = None) -> None:
     step(1, "kernel")
     build_kernel(pins, jobs)
     step(2, "lk2nd")
-    lk_bin = build_lk2nd(pins, jobs)
+    lk_bins = {layout: build_lk2nd(pins, jobs, layout) for layout in profile.LAYOUTS}
     step(3, "toolbox (initramfs + boot image)")
     build_toolbox(pins)
     step(4, "device tree overlays")
     build_dtbo()
-    step(5, "recovery image")
-    build_recovery(lk_bin)
+    step(5, "lk2nd + toolbox images")
+    for layout in profile.LAYOUTS:
+        build_lk2nd_image(lk_bins[layout], layout)
+    build_kaios_recovery()
     step(6, "vbmeta")
     build_vbmeta(pins, stock_override)
-    say("done. Outputs in out/: recovery.img, vbmeta.img, pkmd.bin")
+    say("done. Outputs in out/: recovery.img, vbmeta.img, pkmd.bin, and for the "
+        "linux-first layout linux-first-boot.img, dtbo.img, linux-first-recovery.img")

@@ -1,0 +1,11 @@
+[Unit]
+Description=Battery logger (one line a minute, read by `flip battery`)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/lib/flip/battery-log
+Nice=10
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

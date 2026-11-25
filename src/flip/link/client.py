@@ -89,7 +89,18 @@ class Session:
         return self._drain(stdout, stderr)
 
     def _feed(self, src: BinaryIO) -> None:
-        read = getattr(src, "read1", src.read)
+        # A real file/pipe is read with os.read: this thread is a daemon, and if
+        # it sits inside a buffered reader when flip exits, Python aborts
+        # ("could not acquire lock for <stdin> at interpreter shutdown").
+        try:
+            fd = src.fileno()
+        except (AttributeError, OSError, ValueError):
+            fd = None
+        if fd is not None:
+            def read(n):
+                return os.read(fd, n)
+        else:
+            read = getattr(src, "read1", src.read)
         try:
             while chunk := read(m.CHUNK):
                 self.ch.send(m.STDIN, chunk)

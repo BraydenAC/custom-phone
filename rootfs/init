@@ -372,11 +372,34 @@ sd_share_for_computer() {
 	done
 }
 
-# lk2nd boots the SD card's Linux when restarted with the "recovery" reason
-# (a plain reboot goes back to KaiOS).
+# Where the phone's bootloader finds what (flip_layout= on our command line):
+#   linux-first: boot = lk2nd + this toolbox, recovery = KaiOS
+#   kaios-first: boot = KaiOS, recovery = lk2nd + this toolbox
+# A plain restart starts boot; the "recovery" reason starts recovery.
+# lk2nd boots the SD card's Linux if it finds one.
+if grep -q 'flip_layout=linux-first' /proc/cmdline; then
+	layout=linux-first
+else
+	layout=kaios-first
+fi
+
 start_sd_linux() {
 	sync
-	reboot-mode recovery
+	if [ $layout = linux-first ]; then
+		reboot -f
+	else
+		reboot-mode recovery
+	fi
+	echo "${red}${bold}Restart failed.${normal}"
+}
+
+start_kaios() {
+	sync
+	if [ $layout = linux-first ]; then
+		reboot-mode recovery
+	else
+		reboot -f
+	fi
 	echo "${red}${bold}Restart failed.${normal}"
 }
 
@@ -395,6 +418,7 @@ menu() {
 			echo "5. SD to computer"
 			echo "6. Start SD Linux"
 		fi
+		echo "7. Start KaiOS"
 	fi
 	echo "4. View kernel logs"
 	echo "${normal}==================="
@@ -430,6 +454,9 @@ while true; do
 			;;
 		6)
 			ensure_ums_off && start_sd_linux
+			;;
+		7)
+			ensure_ums_off && start_kaios
 			;;
 	esac
 	menu

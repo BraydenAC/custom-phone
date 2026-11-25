@@ -1,0 +1,18 @@
+[Unit]
+Description=Startup animation on the phone's screen
+# Starts before the screen does: it switches tty1 to graphics mode, reports
+# ready, and only then flip-panel.service turns the screen on, so the text
+# console never shows. Exits by itself once startup is done.
+DefaultDependencies=no
+Wants=flip-panel.service
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=notify
+# If it never reports ready, the screen still starts after this long.
+TimeoutStartSec=5
+ExecStart=/usr/lib/flip/splash
+
+[Install]
+WantedBy=sysinit.target

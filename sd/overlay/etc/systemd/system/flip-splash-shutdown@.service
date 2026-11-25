@@ -1,0 +1,20 @@
+[Unit]
+Description=Shutdown animation on the phone's screen (%i)
+# Starts as the shutdown begins, once the login prompt has let go of tty1.
+DefaultDependencies=no
+After=getty@tty1.service flip-splash.service flip-screen.service
+Before=systemd-poweroff.service systemd-reboot.service
+
+[Service]
+Type=simple
+# Not the template's own slice (system-flip\x2dsplash\x2dshutdown.slice): that
+# one conflicts with shutdown.target, so systemd dropped this unit from every
+# shutdown. system.slice stays up to the end.
+Slice=system.slice
+# argv[0] starting with "@" spares it from systemd-shutdown's final killing
+# spree, so it runs to the end; /usr/lib/systemd/system-shutdown/flip-splash
+# waits for it before the power goes off.
+ExecStart=@/usr/bin/python3 @flip-splash /usr/lib/flip/splash --shutdown %i
+
+[Install]
+WantedBy=%i.target
