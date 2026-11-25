@@ -56,7 +56,13 @@ def host():
 def phone(tmp_path, host):
     p = Phone(tmp_path, [public_bytes(host.public_key())])
     yield p
+    # Close our end first so the server thread sees EOF and exits, and only then
+    # its end: closing both at once frees the fd numbers while the thread may
+    # still be reading them, and the next test's socketpair reuses them (the
+    # stale thread then steals the next client's handshake).
     p.host_sock.close()
+    if p.thread:
+        p.thread.join(5)
     p.phone_sock.close()
 
 
