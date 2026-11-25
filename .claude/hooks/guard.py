@@ -12,6 +12,7 @@ Permission rules match command prefixes; this also sees commands wrapped in
 """
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -53,6 +54,8 @@ ASK = [
     (r"\bgit\s+(reset\s+--hard|clean\s+-\w*f\w*|rebase|filter-branch|filter-repo)\b",
      "rewrites or discards git history / work"),
     (r"\bgit\s+(checkout|restore)\s+(--\s+)?\.(\s|$)", "discards uncommitted changes"),
+    (r"\bgit\s+restore\s+(?!--staged\s)\S|\bgit\s+checkout\s+(\S+\s+)?--\s+\S",
+     "discards uncommitted changes to files"),
     (r"\bgit\s+(branch\s+-D|stash\s+(drop|clear))\b", "deletes a branch or stash"),
     (r"\bgit\s+add\b.*\s(-f|--force)\b", "force-adds an ignored (likely private) file"),
     (r"\bfind\b.*\s(-delete|-exec\s+rm)\b", "mass delete"),
@@ -132,14 +135,30 @@ def current_branch(cwd):
         return ""
 
 
+# The script of `sh -c '...'` (and bash/dash/zsh): checked as a command of its own,
+# since shlex keeps it as one token.
+WRAPPED = re.compile(r"\b(?:sh|bash|dash|zsh)\s+(?:-[a-z]+\s+)*-c\s+(['\"])(.*?)(?<!\\)\1", re.S)
+STRICTNESS = {None: 0, "ask": 1, "deny": 2}
+
+# Limits (a regex guard can't parse shell): eval, $(...) building a command name,
+# variables holding paths, and scripts written to a file and run later all get past
+# it. They still hit the normal permission prompt unless an allow rule matches.
+
+
 def check_bash(command, cwd=None):
     command = without_file_heredocs(command)
     verdict = _check_bash(command)
-    if verdict is None and re.search(r"\bgit\s+(commit|merge|cherry-pick|revert)\b", command) \
-            and not re.search(r"\bgit\s+-C\b", command) \
-            and current_branch(cwd) in ("main", "master"):
-        # Work happens on feature and chunk branches; main changes by PR.
-        return "ask", "commits or merges directly on main (work on a feature branch)"
+    for _, inner in WRAPPED.findall(command):
+        v = _check_bash(inner)
+        if v and STRICTNESS[v[0]] > STRICTNESS[verdict[0] if verdict else None]:
+            verdict = v
+    if verdict is None:
+        m = re.search(r"\bgit\s+(?:-C\s+(\S+)\s+)?(commit|merge|cherry-pick|revert)\b", command)
+        if m:
+            where = os.path.join(cwd or ".", m.group(1).strip("'\"")) if m.group(1) else cwd
+            if current_branch(where) in ("main", "master"):
+                # Work happens on feature and chunk branches; main changes by PR.
+                return "ask", "commits or merges directly on main (work on a feature branch)"
     return verdict
 
 
@@ -147,9 +166,12 @@ def _check_bash(command):
     for pattern, reason in DENY:
         if re.search(pattern, command):
             return "deny", reason
-    if re.search(PRIVATE, command) and re.search(READERS, command) \
-            and not re.match(r"\s*(uv run )?flip\b", command):
-        return "deny", "reads or copies private data (backups, keys, sd.img)"
+    if re.search(PRIVATE, command) and not re.match(r"\s*(uv run )?flip\b", command):
+        # A reader must be a command, not a word in a message (git commit -m '... more').
+        if re.search(CMD + READERS, command):
+            return "deny", "reads or copies private data (backups, keys, sd.img)"
+        if re.search(r"(>>?|\btee\s+(-a\s+)?)\s*['\"]?[^\s'\";|&]*" + PRIVATE, command):
+            return "deny", "writes into private data (backups, keys, sd.img)"
     rm = rm_verdict(command)
     if rm and rm[0] == "deny":
         return rm

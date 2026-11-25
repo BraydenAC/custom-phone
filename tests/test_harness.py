@@ -309,3 +309,37 @@ def test_chunk_developer_codes_but_never_publishes():
 ])
 def test_heredocs_into_files_are_text_others_are_code(guard, command, expected):
     assert bash(guard, command) == expected
+
+
+# Findings from the first pr-reviewer run (PR #5).
+
+@pytest.mark.parametrize("command", [
+    "git commit -m 'backups: more detail in the list'",
+    "git log --grep=backups", "git log --oneline -- backups.md",
+    "git commit -m \"$(printf 'Docs: backups list shows more')\"",
+    "git restore --staged src/flip/sd.py",
+])
+def test_words_in_messages_are_not_commands(guard, command):
+    assert bash(guard, command) is None
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("sh -c 'rm -rf /'", "deny"), ("bash -c \"rm -rf ~\"", "deny"),
+    ("uv run flip phone run -- sh -c 'cd /tmp && rm -rf /'", "deny"),
+    ("sh -c 'rm -rf out/build'", "ask"),
+    ("sh -c 'cat backups/x/persist.img'", "deny"),
+    ("ls backups | xargs cat", "deny"),
+    ("echo hi > backups/x", "deny"), ("echo k | tee -a ~/.config/flip/x", "deny"),
+    ("git restore src/flip/sd.py", "ask"), ("git checkout -- src/flip/sd.py", "ask"),
+    ("git checkout HEAD -- README.md", "ask"),
+])
+def test_wrapped_and_redirected_commands_are_checked(guard, command, expected):
+    assert bash(guard, command) == expected
+
+
+def test_git_dash_c_commit_checks_that_checkouts_branch(guard, monkeypatch):
+    seen = []
+    monkeypatch.setattr(guard, "current_branch", lambda where: seen.append(where) or "main")
+    assert guard.check_bash("git -C . commit -m x", "/repo") == ("ask", guard.check_bash(
+        "git commit -m x", "/repo")[1])
+    assert seen[0] == "/repo/."
