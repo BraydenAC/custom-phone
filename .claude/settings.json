@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(uv run pytest:*)",
+      "Bash(uv sync:*)",
+      "Bash(uv run flip --help)",
+      "Bash(uv run flip --version)",
+      "Bash(uv run flip doctor)",
+      "Bash(uv run flip build:*)",
+      "Bash(uv run flip sd build:*)",
+      "Bash(uv run flip sd info)",
+      "Bash(uv run flip device status)",
+      "Bash(uv run flip device info:*)",
+      "Bash(uv run flip device log:*)",
+      "Bash(uv run flip backup list)",
+      "Bash(uv run flip backup verify:*)",
+      "Bash(uv run flip keys show)",
+      "Bash(uv run flip phone info:*)",
+      "Bash(uv run flip phone run:*)",
+      "Bash(uv run flip phone push:*)",
+      "Bash(uv run flip phone pull:*)",
+      "Bash(uv run flip phone key)",
+      "Bash(uv run flip phone trust list:*)",
+      "Bash(uv run flip battery:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull --ff-only:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git checkout:*)",
+      "Bash(git switch:*)",
+      "Bash(git merge:*)",
+      "Bash(git worktree:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git merge-base:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh auth status)",
+      "Bash(git -C linux diff:*)",
+      "Bash(git -C linux log:*)",
+      "Bash(git -C lk2nd diff:*)",
+      "Bash(git -C lk2nd log:*)",
+      "Bash(lsblk:*)"
+    ],
+    "ask": [
+      "Bash(uv run flip flash:*)",
+      "Bash(uv run flip sd write:*)",
+      "Bash(uv run flip sd update:*)",
+      "Bash(uv run flip backup create:*)",
+      "Bash(uv run flip backup adopt-vbmeta:*)",
+      "Bash(uv run flip keys export:*)",
+      "Bash(uv run flip phone trust add:*)",
+      "Bash(uv run flip phone trust remove:*)",
+      "Bash(uv run flip phone setup-host:*)",
+      "Bash(uv run flip phone pin:*)",
+      "Bash(uv run flip clean:*)",
+      "Bash(sudo:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh pr close:*)",
+      "Bash(gh pr comment:*)",
+      "Bash(gh pr review:*)",
+      "Bash(gh pr edit:*)",
+      "Bash(gh api:*)",
+      "Bash(git reset --hard:*)",
+      "Bash(git clean:*)",
+      "Bash(git rebase:*)",
+      "Bash(rm -r:*)",
+      "Bash(rm -rf:*)",
+      "Bash(rm -fr:*)"
+    ],
+    "deny": [
+      "Read(./backups/**)",
+      "Edit(./backups/**)",
+      "Read(./out/sd/sd.img)",
+      "Read(./out/linux-first-recovery.img)",
+      "Read(**/*.pem)",
+      "Edit(**/*.pem)",
+      "Read(~/.config/flip/**)",
+      "Edit(~/.config/flip/**)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|Read|Edit|Write|NotebookEdit|Grep|Glob",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard.py\"",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/run-tests.py\"",
+            "timeout": 320
+          }
+        ]
+      }
+    ]
+  }
+}

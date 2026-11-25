@@ -10,6 +10,10 @@ USB (for backups and modifications), and lk2nd can boot a full Linux system
 from an SD card. It does not work on the Nokia 2760 Flip (no
 `fastboot oem sudo`).
 
+![flip system overview](docs/images/system-overview.svg)
+
+How the pieces fit together, and what runs on the phone: [docs/architecture.md](docs/architecture.md).
+
 ## Setup
 
 On Arch Linux:
@@ -237,6 +241,11 @@ could change those partitions.
 ```sh
 uv run pytest
 ```
+
+Working with an AI coding agent: `CLAUDE.md` and `.claude/` hold the
+project's agent harness (rules, permission guard, workflow skills) for
+[Claude Code](https://claude.com/claude-code). It is plain text and
+documents the workflows for people too.
 
 # Sideloading guide
 

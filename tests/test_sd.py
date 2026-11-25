@@ -400,6 +400,9 @@ def test_asks_phone_to_share_card_one_operation_per_session(monkeypatch):
 
 @pytest.mark.skipif(shutil.which(sd.config.cross_compile() + "gcc") is None,
                     reason="needs the aarch64 cross compiler")
+@pytest.mark.skipif(not (sd.config.LINUX_DIR / "tools/include/nolibc/nolibc.h").exists(),
+                    reason="needs the fetched kernel tree (flip build); absent in a fresh "
+                           "clone or a worktree")
 def test_reboot_mode_helper_builds_reproducibly(tmp_path, monkeypatch):
     from flip import build
     monkeypatch.setattr(sd.config, "OUT", tmp_path)
