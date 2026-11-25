@@ -30,6 +30,7 @@ depmod "$KVER"
 
 systemctl enable flip-gadget.service flip-panel.service flip-splash.service flip-device-addresses.service nftables.service NetworkManager.service
 systemctl enable flip-splash-shutdown@poweroff.service flip-splash-shutdown@reboot.service
+systemctl enable flip-screen.service flip-battery-log.service
 if [ "$DEBUG" = 1 ]; then
 	systemctl enable serial-getty@ttyGS0.service
 else

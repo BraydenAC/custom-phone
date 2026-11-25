@@ -2,7 +2,7 @@
 Description=Shutdown animation on the phone's screen (%i)
 # Starts as the shutdown begins, once the login prompt has let go of tty1.
 DefaultDependencies=no
-After=getty@tty1.service flip-splash.service
+After=getty@tty1.service flip-splash.service flip-screen.service
 Before=systemd-poweroff.service systemd-reboot.service
 
 [Service]

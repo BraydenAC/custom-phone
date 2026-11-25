@@ -33,6 +33,7 @@ CONFIG = "/etc/flip/splash.conf"
 FB = "/dev/fb0"
 FB_SYS = "/sys/class/graphics/fb0"
 TTY = "/dev/tty1"
+SPLASH_PID = "/run/flip-splash.pid"  # the screen manager leaves the screen alone meanwhile
 KDSETMODE, KDGETMODE, KD_TEXT, KD_GRAPHICS = 0x4B3A, 0x4B3B, 0x00, 0x01
 FBIOGET_VSCREENINFO, FBIOPUT_VSCREENINFO, FBIOBLANK = 0x4600, 0x4601, 0x4611
 FB_VAR_SIZE, FB_VAR_ACTIVATE, FB_ACTIVATE_FORCE, FB_BLANK_UNBLANK = 160, 84, 0x80, 0
@@ -588,11 +589,20 @@ def main(argv):
         return 0
 
     start = time.monotonic()
+    try:  # flip's screen manager (/usr/lib/flip/screen) waits while this runs
+        with open(SPLASH_PID, "w") as f:
+            f.write(f"{os.getpid()}\n")
+    except OSError:
+        pass
     try:
         frames = run(Screen(fb, w, h, stride), cfg, Progress(demo),
                      keep_screen=keep_screen)
     finally:
         give_back()
+        try:
+            os.unlink(SPLASH_PID)
+        except OSError:
+            pass
     if demo is not None:
         took = time.monotonic() - start
         print(f"{cfg['style']}: {frames} frames in {took:.1f} s ({frames / took:.1f} fps)")
