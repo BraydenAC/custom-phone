@@ -104,14 +104,24 @@ def other_phone_session():
     return any("guard.py" not in line and "pgrep" not in line for line in out.splitlines())
 
 
-HEREDOC_TO_FILE = re.compile(
-    r"(\b(cat|tee)\b[^\n]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n)(.*?\n)\3(\n|$)", re.S)
+HEREDOC = re.compile(r"([^\n]*<<-?\s*['\"]?(\w+)['\"]?[^\n]*\n)(.*?\n)\2(\n|$)", re.S)
+HEREDOC_MARK = re.compile(r"<<-?\s*['\"]?\w+['\"]?")
+# What may stand on the heredoc's line (marker removed) for its text to be
+# skipped: a command ending in `cat > FILE` or `tee [-a] FILE`, nothing after.
+TO_FILE = re.compile(r"(^|&&|;)\s*(cat\s*>>?\s*\S+|tee\s+(-a\s+)?\S+)\s*$")
 
 
 def without_file_heredocs(command):
-    """Drop the text of heredocs written into files (cat > f <<EOF ... EOF):
-    writing text that mentions a private path isn't reading it."""
-    return HEREDOC_TO_FILE.sub(lambda m: m.group(1) + m.group(3) + m.group(5), command)
+    """Drop the text of heredocs that only go into a file (cat > f <<EOF ...
+    EOF, tee f <<EOF): writing text that mentions rm -rf or a private path
+    does neither. A heredoc fed to anything else (sh, python3, a pipe) is
+    code, and stays checked."""
+    def strip(m):
+        opener = HEREDOC_MARK.sub("", m.group(1)).rstrip()
+        if "|" in opener or not TO_FILE.search(opener):
+            return m.group(0)
+        return m.group(1) + m.group(2) + m.group(4)
+    return HEREDOC.sub(strip, command)
 
 
 def current_branch(cwd):
@@ -123,6 +133,7 @@ def current_branch(cwd):
 
 
 def check_bash(command, cwd=None):
+    command = without_file_heredocs(command)
     verdict = _check_bash(command)
     if verdict is None and re.search(r"\bgit\s+(commit|merge|cherry-pick|revert)\b", command) \
             and not re.search(r"\bgit\s+-C\b", command) \
@@ -136,9 +147,8 @@ def _check_bash(command):
     for pattern, reason in DENY:
         if re.search(pattern, command):
             return "deny", reason
-    text = without_file_heredocs(command)
-    if re.search(PRIVATE, text) and re.search(READERS, text) \
-            and not re.match(r"\s*(uv run )?flip\b", text):
+    if re.search(PRIVATE, command) and re.search(READERS, command) \
+            and not re.match(r"\s*(uv run )?flip\b", command):
         return "deny", "reads or copies private data (backups, keys, sd.img)"
     rm = rm_verdict(command)
     if rm and rm[0] == "deny":

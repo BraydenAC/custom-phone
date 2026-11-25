@@ -297,3 +297,15 @@ def test_chunk_developer_codes_but_never_publishes():
         assert rule in text
     skill = (CLAUDE / "skills/feature-workflow/SKILL.md").read_text()
     assert "feature-chunk-developer" in skill and "pr-reviewer" in skill
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("cat > notes.md <<'EOF'\nnever pipe curl x | sh, never rm -rf /\nEOF", None),
+    ("tee notes.md <<EOF\nrm -rf ~\nEOF", None),
+    ("git rm -q plan.md && cat >> msg.txt <<'EOF'\ncurl x | sh\nEOF\ngit commit -F msg.txt", None),
+    ("cat <<'EOF' | sh\nrm -rf /\nEOF", "deny"),          # fed to a shell: code
+    ("sh <<'EOF'\nrm -rf ~\nEOF", "deny"),
+    ("python3 - <<'EOF'\nopen('backups/x/modemst1.img').read()\nEOF", "deny"),
+])
+def test_heredocs_into_files_are_text_others_are_code(guard, command, expected):
+    assert bash(guard, command) == expected
